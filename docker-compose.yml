@@ -1,0 +1,45 @@
+services:
+  copilot-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "4141:4141"
+    volumes:
+      # 持久化 GitHub token 和配置文件，避免每次重启都需要重新认证
+      - ~/.local/share/copilot-api:/root/.local/share/copilot-api
+    environment:
+      # 使用 GitHub Copilot device code 认证（不需要 API Key）
+      # 首次启动前必须先执行认证流程（见下方说明）
+      # GH_TOKEN 留空表示使用已持久化的 token 文件
+      GH_TOKEN: ""
+
+      # ── 可选配置 ──────────────────────────────────────────────
+      # 如需更准确的 Claude token 计数，可填入 Anthropic API Key（token counting 本身免费）
+      # ANTHROPIC_API_KEY: "sk-ant-..."
+
+      # 是否使用 opencode OAuth App 进行认证（默认为空，即标准 GitHub OAuth）
+      # COPILOT_API_OAUTH_APP: "opencode"
+
+      # GitHub Enterprise 地址（个人用户留空）
+      # COPILOT_API_ENTERPRISE_URL: ""
+
+      # ── 代理配置 ──────────────────────────────────────────────
+      # macOS 宿主机代理：host.docker.internal 是容器访问宿主机的特殊域名
+      # 端口改为你本机代理监听的端口（常见：7890 / 1087 / 7897）
+      HTTP_PROXY: "http://host.docker.internal:7890"
+      HTTPS_PROXY: "http://host.docker.internal:7890"
+      # localhost 及容器内部通信不走代理
+      NO_PROXY: "localhost,127.0.0.1"
+
+      # ── VS Code 版本伪装 ────────────────────────────────────────
+      # 由 start.sh 自动从宿主机读取并写入 .env，也可手动覆盖
+      # 未检测到时 fallback 到 1.110.1
+      VSCODE_VERSION: "${VSCODE_VERSION:-1.110.1}"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:4141/"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
