@@ -1,7 +1,8 @@
 import consola from "consola"
 import { events } from "fetch-event-stream"
 
-import type { SubagentMarker } from "~/routes/messages/subagent-marker"
+import type { CompactType } from "~/lib/compact"
+import type { SubagentMarker } from "~/lib/subagent"
 
 import {
   copilotBaseUrl,
@@ -9,6 +10,7 @@ import {
   prepareForCompact,
   prepareInteractionHeaders,
 } from "~/lib/api-config"
+import { logCopilotRateLimits } from "~/lib/copilot-rate-limit"
 import { HTTPError } from "~/lib/error"
 import { state } from "~/lib/state"
 
@@ -25,6 +27,7 @@ export interface ResponsesPayload {
   stream?: boolean | null
   safety_identifier?: string | null
   prompt_cache_key?: string | null
+  prompt_cache_retention?: "in_memory" | "24h" | null
   parallel_tool_calls?: boolean | null
   store?: boolean | null
   reasoning?: Reasoning | null
@@ -121,6 +124,7 @@ export type ResponseInputItem =
 export type ResponseInputContent =
   | ResponseInputText
   | ResponseInputImage
+  | ResponseInputFile
   | Record<string, unknown>
 
 export interface ResponseInputText {
@@ -133,6 +137,13 @@ export interface ResponseInputImage {
   image_url?: string | null
   file_id?: string | null
   detail: "low" | "high" | "auto"
+}
+
+export interface ResponseInputFile {
+  type: "input_file"
+  file_data?: string | null
+  file_id?: string | null
+  filename?: string | null
 }
 
 export interface ResponsesResult {
@@ -358,7 +369,7 @@ interface ResponsesRequestOptions {
   subagentMarker?: SubagentMarker | null
   requestId: string
   sessionId?: string
-  isCompact?: boolean
+  compactType?: CompactType
 }
 
 export const createResponses = async (
@@ -369,7 +380,7 @@ export const createResponses = async (
     subagentMarker,
     requestId,
     sessionId,
-    isCompact,
+    compactType,
   }: ResponsesRequestOptions,
 ): Promise<CreateResponsesReturn> => {
   if (!state.copilotToken) throw new Error("Copilot token not found")
@@ -381,16 +392,20 @@ export const createResponses = async (
 
   prepareInteractionHeaders(sessionId, Boolean(subagentMarker), headers)
 
-  prepareForCompact(headers, isCompact)
+  prepareForCompact(headers, compactType)
 
   // service_tier is not supported by github copilot
-  payload.service_tier = null
+  payload.service_tier = undefined
+
+  consola.log(`<-- model: ${payload.model}`)
 
   const response = await fetch(`${copilotBaseUrl(state)}/responses`, {
     method: "POST",
     headers,
     body: JSON.stringify(payload),
   })
+
+  logCopilotRateLimits(response.headers)
 
   if (!response.ok) {
     consola.error("Failed to create responses", response)

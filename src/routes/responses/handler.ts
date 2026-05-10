@@ -4,14 +4,20 @@ import { streamSSE } from "hono/streaming"
 
 import { awaitApproval } from "~/lib/approval"
 import { getConfig, isResponsesApiWebSearchEnabled } from "~/lib/config"
-import { createHandlerLogger } from "~/lib/logger"
+import { createHandlerLogger, debugJson, debugJsonTail } from "~/lib/logger"
 import { checkRateLimit } from "~/lib/rate-limit"
 import { state } from "~/lib/state"
+import {
+  createCopilotTokenUsageRecorder,
+  normalizeResponsesUsage,
+  type UsageTokens,
+} from "~/lib/token-usage"
 import { generateRequestIdFromPayload, getUUID } from "~/lib/utils"
 import {
   createResponses,
   type ResponsesPayload,
   type ResponsesResult,
+  type ResponseStreamEvent,
 } from "~/services/copilot/create-responses"
 
 import { createStreamIdTracker, fixStreamIds } from "./stream-id-sync"
@@ -29,7 +35,7 @@ export const handleResponses = async (c: Context) => {
   await checkRateLimit(state)
 
   const payload = await c.req.json<ResponsesPayload>()
-  logger.debug("Responses request payload:", JSON.stringify(payload))
+  debugJson(logger, "Responses request payload:", payload)
 
   // not support subagent marker for now , set sessionId = getUUID(requestId)
   const requestId = generateRequestIdFromPayload({ messages: payload.input })
@@ -37,8 +43,15 @@ export const handleResponses = async (c: Context) => {
 
   const sessionId = getUUID(requestId)
   logger.debug("Extracted session ID:", sessionId)
+  const recordUsage = createCopilotTokenUsageRecorder({
+    endpoint: "responses",
+    fallbackSessionId: sessionId,
+    model: payload.model,
+  })
 
   useFunctionApplyPatch(payload)
+
+  removeUnsupportedTools(payload)
 
   if (!isResponsesApiWebSearchEnabled()) {
     removeWebSearchTool(payload)
@@ -70,7 +83,7 @@ export const handleResponses = async (c: Context) => {
     selectedModel?.capabilities.limits.max_prompt_tokens,
   )
 
-  logger.debug("Translated Responses payload:", JSON.stringify(payload))
+  debugJson(logger, "Translated Responses payload:", payload)
 
   const { vision, initiator } = getResponsesRequestOptions(payload)
 
@@ -89,9 +102,18 @@ export const handleResponses = async (c: Context) => {
     logger.debug("Forwarding native Responses stream")
     return streamSSE(c, async (stream) => {
       const idTracker = createStreamIdTracker()
+      let usage: UsageTokens = {}
 
       for await (const chunk of response) {
-        logger.debug("Responses stream chunk:", JSON.stringify(chunk))
+        debugJson(logger, "Responses stream chunk:", chunk)
+        const parsedEvent = parseResponsesStreamEvent(chunk)
+        if (
+          parsedEvent?.type === "response.completed"
+          || parsedEvent?.type === "response.failed"
+          || parsedEvent?.type === "response.incomplete"
+        ) {
+          usage = normalizeResponsesUsage(parsedEvent.response.usage)
+        }
 
         const processedData = fixStreamIds(
           (chunk as { data?: string }).data ?? "",
@@ -105,13 +127,16 @@ export const handleResponses = async (c: Context) => {
           data: processedData,
         })
       }
+
+      recordUsage(usage)
     })
   }
 
-  logger.debug(
-    "Forwarding native Responses result:",
-    JSON.stringify(response).slice(-400),
-  )
+  debugJsonTail(logger, "Forwarding native Responses result:", {
+    value: response,
+    tailLength: 400,
+  })
+  recordUsage(normalizeResponsesUsage((response as ResponsesResult).usage))
   return c.json(response as ResponsesResult)
 }
 
@@ -121,6 +146,21 @@ const isAsyncIterable = <T>(value: unknown): value is AsyncIterable<T> =>
 
 const isStreamingRequested = (payload: ResponsesPayload): boolean =>
   Boolean(payload.stream)
+
+const parseResponsesStreamEvent = (
+  chunk: unknown,
+): ResponseStreamEvent | null => {
+  const data = (chunk as { data?: string }).data
+  if (!data || data === "[DONE]") {
+    return null
+  }
+
+  try {
+    return JSON.parse(data) as ResponseStreamEvent
+  } catch {
+    return null
+  }
+}
 
 const useFunctionApplyPatch = (payload: ResponsesPayload): void => {
   const config = getConfig()
@@ -160,4 +200,23 @@ const removeWebSearchTool = (payload: ResponsesPayload): void => {
   payload.tools = payload.tools.filter((t) => {
     return t.type !== "web_search"
   })
+}
+
+const COPILOT_UNSUPPORTED_TOOL_TYPES = new Set(["image_generation"])
+
+export const removeUnsupportedTools = (payload: ResponsesPayload): void => {
+  if (!Array.isArray(payload.tools) || payload.tools.length === 0) return
+
+  const dropped: Array<string> = []
+  payload.tools = payload.tools.filter((t) => {
+    const type = t.type as string
+    if (COPILOT_UNSUPPORTED_TOOL_TYPES.has(type)) {
+      dropped.push(type)
+      return false
+    }
+    return true
+  })
+  if (dropped.length > 0) {
+    logger.debug("Removed unsupported tools:", dropped)
+  }
 }

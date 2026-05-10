@@ -3,13 +3,18 @@ import type { Context } from "hono"
 import { streamSSE, type SSEMessage } from "hono/streaming"
 
 import { awaitApproval } from "~/lib/approval"
-import { createHandlerLogger } from "~/lib/logger"
+import { createHandlerLogger, debugJson, debugJsonTail } from "~/lib/logger"
 import { checkRateLimit } from "~/lib/rate-limit"
 import { state } from "~/lib/state"
-import { getTokenCount } from "~/lib/tokenizer"
+import {
+  createCopilotTokenUsageRecorder,
+  normalizeOpenAIUsage,
+  type UsageTokens,
+} from "~/lib/token-usage"
 import { generateRequestIdFromPayload, getUUID, isNullish } from "~/lib/utils"
 import {
   createChatCompletions,
+  type ChatCompletionChunk,
   type ChatCompletionResponse,
   type ChatCompletionsPayload,
 } from "~/services/copilot/create-chat-completions"
@@ -20,23 +25,23 @@ export async function handleCompletion(c: Context) {
   await checkRateLimit(state)
 
   let payload = await c.req.json<ChatCompletionsPayload>()
-  logger.debug("Request payload:", JSON.stringify(payload).slice(-400))
+  debugJsonTail(logger, "Request payload:", { value: payload, tailLength: 400 })
 
   // Find the selected model
   const selectedModel = state.models?.data.find(
     (model) => model.id === payload.model,
   )
 
-  // Calculate and display token count
-  try {
-    if (selectedModel) {
-      const tokenCount = await getTokenCount(payload, selectedModel)
-      logger.info("Current token count:", tokenCount)
-    } else {
-      logger.warn("No model selected, skipping token count calculation")
-    }
-  } catch (error) {
-    logger.warn("Failed to calculate token count:", error)
+  if (selectedModel?.id === "gpt-5.4") {
+    return c.json(
+      {
+        error: {
+          message: "Please use `/v1/responses` or `/v1/messages` API",
+          type: "invalid_request_error",
+        },
+      },
+      400,
+    )
   }
 
   if (state.manualApprove) await awaitApproval()
@@ -46,7 +51,7 @@ export async function handleCompletion(c: Context) {
       ...payload,
       max_tokens: selectedModel?.capabilities.limits.max_output_tokens,
     }
-    logger.debug("Set max_tokens to:", JSON.stringify(payload.max_tokens))
+    debugJson(logger, "Set max_tokens to:", payload.max_tokens)
   }
 
   // not support subagent marker for now , set sessionId = getUUID(requestId)
@@ -55,6 +60,11 @@ export async function handleCompletion(c: Context) {
 
   const sessionId = getUUID(requestId)
   logger.debug("Extracted session ID:", sessionId)
+  const recordUsage = createCopilotTokenUsageRecorder({
+    endpoint: "chat_completions",
+    fallbackSessionId: sessionId,
+    model: payload.model,
+  })
 
   const response = await createChatCompletions(payload, {
     requestId,
@@ -62,19 +72,43 @@ export async function handleCompletion(c: Context) {
   })
 
   if (isNonStreaming(response)) {
-    logger.debug("Non-streaming response:", JSON.stringify(response))
+    debugJson(logger, "Non-streaming response:", response)
+    recordUsage(normalizeOpenAIUsage(response.usage))
     return c.json(response)
   }
 
   logger.debug("Streaming response")
   return streamSSE(c, async (stream) => {
+    let usage: UsageTokens = {}
+
     for await (const chunk of response) {
-      logger.debug("Streaming chunk:", JSON.stringify(chunk))
+      debugJson(logger, "Streaming chunk:", chunk)
+      const parsedChunk = parseChatCompletionChunk(chunk)
+      if (parsedChunk?.usage) {
+        usage = normalizeOpenAIUsage(parsedChunk.usage)
+      }
       await stream.writeSSE(chunk as SSEMessage)
     }
+
+    recordUsage(usage)
   })
 }
 
 const isNonStreaming = (
   response: Awaited<ReturnType<typeof createChatCompletions>>,
 ): response is ChatCompletionResponse => Object.hasOwn(response, "choices")
+
+const parseChatCompletionChunk = (
+  chunk: unknown,
+): ChatCompletionChunk | null => {
+  const data = (chunk as { data?: string }).data
+  if (!data || data === "[DONE]") {
+    return null
+  }
+
+  try {
+    return JSON.parse(data) as ChatCompletionChunk
+  } catch {
+    return null
+  }
+}

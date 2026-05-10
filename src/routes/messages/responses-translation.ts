@@ -9,6 +9,7 @@ import {
   type ResponsesPayload,
   type ResponseInputCompaction,
   type ResponseInputContent,
+  type ResponseInputFile,
   type ResponseInputImage,
   type ResponseInputItem,
   type ResponseInputMessage,
@@ -33,6 +34,7 @@ import {
 import {
   type AnthropicAssistantContentBlock,
   type AnthropicAssistantMessage,
+  type AnthropicDocumentBlock,
   type AnthropicResponse,
   type AnthropicImageBlock,
   type AnthropicMessage,
@@ -40,6 +42,7 @@ import {
   type AnthropicTextBlock,
   type AnthropicThinkingBlock,
   type AnthropicTool,
+  type AnthropicToolResultContentBlock,
   type AnthropicToolResultBlock,
   type AnthropicToolUseBlock,
   type AnthropicUserContentBlock,
@@ -66,7 +69,8 @@ export const translateAnthropicMessagesToResponsesPayload = (
   const translatedTools = convertAnthropicTools(payload.tools)
   const toolChoice = convertAnthropicToolChoice(payload.tool_choice)
 
-  const { safetyIdentifier, sessionId: promptCacheKey } = parseUserIdMetadata(
+  // Remove safetyIdentifier to align with vscode copilot
+  const { sessionId: promptCacheKey } = parseUserIdMetadata(
     payload.metadata?.user_id,
   )
 
@@ -80,8 +84,8 @@ export const translateAnthropicMessagesToResponsesPayload = (
     tools: translatedTools,
     tool_choice: toolChoice,
     metadata: payload.metadata ? { ...payload.metadata } : null,
-    safety_identifier: safetyIdentifier,
     prompt_cache_key: promptCacheKey,
+    //prompt_cache_retention: "24h",  not work in gpt-5.4
     stream: payload.stream ?? null,
     store: false,
     parallel_tool_calls: true,
@@ -167,8 +171,8 @@ const translateUserMessage = (
     }
 
     const converted = translateUserContentBlock(block)
-    if (converted) {
-      pendingContent.push(converted)
+    if (converted.length > 0) {
+      pendingContent.push(...converted)
     }
   }
 
@@ -246,16 +250,19 @@ const translateAssistantMessage = (
 
 const translateUserContentBlock = (
   block: AnthropicUserContentBlock,
-): ResponseInputContent | undefined => {
+): Array<ResponseInputContent> => {
   switch (block.type) {
     case "text": {
-      return createTextContent(block.text)
+      return [createTextContent(block.text)]
     }
     case "image": {
-      return createImageContent(block)
+      return [createImageContent(block)]
+    }
+    case "document": {
+      return [createFileContent(block)]
     }
     default: {
-      return undefined
+      return []
     }
   }
 }
@@ -348,6 +355,14 @@ const createImageContent = (
   detail: "auto",
 })
 
+const createFileContent = (
+  block: AnthropicDocumentBlock,
+): ResponseInputFile => ({
+  type: "input_file",
+  file_data: `data:${block.source.media_type};base64,${block.source.data}`,
+  filename: block.title ?? "document.pdf",
+})
+
 const createReasoningContent = (
   block: AnthropicThinkingBlock,
 ): ResponseInputReasoning => {
@@ -430,7 +445,7 @@ const translateSystemPrompt = (
   const text = system
     .map((block, index) => {
       if (index === 0) {
-        return block.text + extraPrompt
+        return block.text + "\n\n" + extraPrompt + "\n\n"
       }
       return block.text
     })
@@ -754,7 +769,7 @@ const isResponseOutputRefusal = (
   && (block as { type?: unknown }).type === "refusal"
 
 const convertToolResultContent = (
-  content: string | Array<AnthropicTextBlock | AnthropicImageBlock>,
+  content: string | Array<AnthropicToolResultContentBlock>,
 ): string | Array<ResponseInputContent> => {
   if (typeof content === "string") {
     return content
@@ -770,6 +785,14 @@ const convertToolResultContent = (
         }
         case "image": {
           result.push(createImageContent(block))
+          break
+        }
+        case "document": {
+          result.push(createFileContent(block))
+          break
+        }
+        case "tool_reference": {
+          result.push(createTextContent(`Tool ${block.tool_name} loaded`))
           break
         }
         default: {

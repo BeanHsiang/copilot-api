@@ -1,7 +1,10 @@
 import { randomUUID } from "node:crypto"
 
+import { COMPACT_REQUEST, type CompactType } from "~/lib/compact"
+
 import type { State } from "./state"
 
+import { getCachedOpencodeVersion } from "./opencode"
 import { requestContext } from "./request-context"
 
 export const isOpencodeOauthApp = (): boolean => {
@@ -36,8 +39,15 @@ const getOpencodeOauthHeaders = (): Record<string, string> => {
   return {
     Accept: "application/json",
     "Content-Type": "application/json",
-    "User-Agent":
-      "opencode/1.3.9 ai-sdk/provider-utils/4.0.21 runtime/bun/1.3.11, opencode/1.3.9",
+    "User-Agent": getOpencodeVersion(),
+  }
+}
+
+const getOpencodeLLMHeaders = (): Record<string, string> => {
+  return {
+    Accept: "application/json",
+    "Content-Type": "application/json",
+    "User-Agent": OPENCODE_LLM_USER_AGENT,
   }
 }
 
@@ -88,10 +98,14 @@ export const getOauthAppConfig = (): OauthAppConfig => {
 
 export const prepareForCompact = (
   headers: Record<string, string>,
-  isCompact?: boolean,
+  compactType?: CompactType,
 ) => {
-  if (isCompact) {
+  if (compactType) {
     headers["x-initiator"] = "agent"
+    if (!isOpencodeOauthApp() && compactType === COMPACT_REQUEST) {
+      headers["x-interaction-type"] = "conversation-other"
+      headers["openai-intent"] = "conversation-other"
+    }
   }
 }
 
@@ -119,9 +133,23 @@ export const standardHeaders = () => ({
   accept: "application/json",
 })
 
-const COPILOT_VERSION = "0.38.2"
+export const getOpencodeVersion = () => {
+  const version = getCachedOpencodeVersion()
+  if (version) {
+    return "opencode/" + version
+  }
+  return OPENCODE_VERSION
+}
+
+const OPENCODE_VERSION = "opencode/1.14.29"
+const OPENCODE_LLM_USER_AGENT =
+  "opencode/1.14.29 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13, opencode/1.14.29"
+
+const COPILOT_VERSION = "0.46.0"
 const EDITOR_PLUGIN_VERSION = `copilot-chat/${COPILOT_VERSION}`
 const USER_AGENT = `GitHubCopilotChat/${COPILOT_VERSION}`
+const CLAUDE_AGENT_USER_AGENT =
+  "vscode_claude_code/2.1.112 (external, sdk-ts, agent-sdk/0.2.112)"
 
 const API_VERSION = "2025-10-01"
 
@@ -144,6 +172,56 @@ export const copilotBaseUrl = (state: State) => {
     : `https://api.${state.accountType}.githubcopilot.com`
 }
 
+export const prepareMessageProxyHeaders = (headers: Record<string, string>) => {
+  if (isOpencodeOauthApp()) {
+    return
+  }
+
+  // vscode copilot claude agent regenerates request id for
+  // each request, keeping it consistent
+  const requestIdValue = randomUUID()
+  headers["x-agent-task-id"] = requestIdValue
+  headers["x-request-id"] = requestIdValue
+
+  // Consistent with vscode copilot claude agent
+  headers["x-interaction-type"] = "messages-proxy"
+  headers["openai-intent"] = "messages-proxy"
+  headers["user-agent"] = CLAUDE_AGENT_USER_AGENT
+
+  delete headers["copilot-integration-id"]
+}
+
+export const githubUserHeaders = (state: State): Record<string, string> => {
+  if (isOpencodeOauthApp()) {
+    return {
+      Authorization: `Bearer ${state.githubToken}`,
+      "User-Agent": getOpencodeVersion(),
+    }
+  }
+  return {
+    accept: "application/vnd.github+json",
+    authorization: `token ${state.githubToken}`,
+    "user-agent": USER_AGENT,
+    "x-github-api-version": "2022-11-28",
+    "x-vscode-user-agent-library-version": "electron-fetch",
+  }
+}
+
+export const copilotModelsHeaders = (state: State) => {
+  if (isOpencodeOauthApp()) {
+    return {
+      Authorization: `Bearer ${state.copilotToken}`,
+      "User-Agent": getOpencodeVersion(),
+    }
+  }
+  const headers = githubCopilotHeaders(state)
+  headers["x-interaction-type"] = "model-access"
+  headers["openai-intent"] = "model-access"
+  delete headers["x-interaction-id"]
+  delete headers["content-type"]
+  return headers
+}
+
 export const copilotHeaders = (
   state: State,
   requestId?: string,
@@ -152,13 +230,24 @@ export const copilotHeaders = (
   if (isOpencodeOauthApp()) {
     const headers: Record<string, string> = {
       Authorization: `Bearer ${state.copilotToken}`,
-      ...getOpencodeOauthHeaders(),
+      ...getOpencodeLLMHeaders(),
       "Openai-Intent": "conversation-edits",
     }
 
-    const userAgent = requestContext.getStore()?.userAgent.trim()
+    const store = requestContext.getStore()
+    const userAgent = store?.userAgent.trim()
+    // Real opencode traffic already carries a versioned opencode/* UA,
+    // so prefer the inbound header to keep upstream behavior aligned.
     if (userAgent?.startsWith("opencode/")) {
       headers["User-Agent"] = normalizeOpencodeUserAgent(userAgent)
+    }
+
+    if (store?.sessionAffinity) {
+      headers["x-session-affinity"] = store.sessionAffinity
+    }
+
+    if (store?.parentSessionId) {
+      headers["x-parent-session-id"] = store.parentSessionId
     }
 
     if (vision) headers["Copilot-Vision-Request"] = "true"
@@ -166,11 +255,20 @@ export const copilotHeaders = (
     return headers
   }
 
+  return githubCopilotHeaders(state, requestId, vision)
+}
+
+const githubCopilotHeaders = (
+  state: State,
+  requestId?: string,
+  vision: boolean = false,
+) => {
   const requestIdValue = requestId ?? randomUUID()
   const headers: Record<string, string> = {
     Authorization: `Bearer ${state.copilotToken}`,
     "content-type": standardHeaders()["content-type"],
     "copilot-integration-id": "vscode-chat",
+    "editor-device-id": state.vsCodeDeviceId,
     "editor-version": `vscode/${state.vsCodeVersion}`,
     "editor-plugin-version": EDITOR_PLUGIN_VERSION,
     "user-agent": USER_AGENT,
@@ -196,7 +294,7 @@ export const copilotHeaders = (
 }
 
 export const GITHUB_API_BASE_URL = "https://api.github.com"
-export const githubHeaders = (state: State) => {
+export const githubHeaders = (state: State): Record<string, string> => {
   if (isOpencodeOauthApp()) {
     return {
       Authorization: `Bearer ${state.githubToken}`,
@@ -204,7 +302,6 @@ export const githubHeaders = (state: State) => {
     }
   }
   return {
-    ...standardHeaders(),
     authorization: `token ${state.githubToken}`,
     "user-agent": USER_AGENT,
     "x-github-api-version": "2025-04-01",

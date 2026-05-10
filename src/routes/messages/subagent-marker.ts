@@ -1,17 +1,13 @@
+import { subagentMarkerPrefix, type SubagentMarker } from "~/lib/subagent"
+
 import type { AnthropicMessagesPayload } from "./anthropic-types"
-
-const subagentMarkerPrefix = "__SUBAGENT_MARKER__"
-
-export interface SubagentMarker {
-  session_id: string
-  agent_id: string
-  agent_type: string
-}
 
 export const parseSubagentMarkerFromFirstUser = (
   payload: AnthropicMessagesPayload,
 ): SubagentMarker | null => {
-  const firstUserMessage = payload.messages.find((msg) => msg.role === "user")
+  const firstUserMessage = payload.messages.find(
+    (msg) => msg.role === "user" && Array.isArray(msg.content),
+  )
   if (!firstUserMessage || !Array.isArray(firstUserMessage.content)) {
     return null
   }
