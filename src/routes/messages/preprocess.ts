@@ -1,4 +1,4 @@
-import type { Model } from "~/services/copilot/get-models"
+import type { Model } from "~/lib/types/models"
 
 import {
   COMPACT_AUTO_CONTINUE,
@@ -11,32 +11,298 @@ import {
   type CompactType,
 } from "~/lib/compact"
 import { getReasoningEffortForModel } from "~/lib/config"
+import { normalizeSdkModelId } from "~/lib/models"
 
 import type {
+  AnthropicAssistantContentBlock,
+  AnthropicCacheControl,
   AnthropicDocumentBlock,
   AnthropicImageBlock,
+  AnthropicInputMessage,
   AnthropicMessage,
   AnthropicMessagesPayload,
   AnthropicTextBlock,
   AnthropicToolResultBlock,
+  AnthropicToolResultContentBlock,
   AnthropicUserContentBlock,
-} from "./anthropic-types"
+  AnthropicUserMessage,
+} from "~/lib/types/anthropic"
 
 export const TOOL_REFERENCE_TURN_BOUNDARY = "Tool loaded."
+const SYSTEM_REMINDER_START = "<system-reminder>"
+const SYSTEM_REMINDER_END = "</system-reminder>"
+const SUBAGENT_START_HOOK_ADDITIONAL_PREFIX = "SubagentStart hook additional"
+export const claudeAutoModelSystemPromptStart =
+  "You are a security monitor for autonomous AI coding agents."
+export const claudeAutoModelStopSequence = "</block>"
 
-const IDE_EXECUTE_CODE_TOOL = "mcp__ide__executeCode"
 const IDE_GET_DIAGNOSTICS_TOOL = "mcp__ide__getDiagnostics"
 const IDE_GET_DIAGNOSTICS_DESCRIPTION =
   "Get language diagnostics from VS Code. Returns errors, warnings, information, and hints for files in the workspace."
 const PDF_FILE_READ_PREFIX = "PDF file read:"
+const CLAUDE_CODE_BILLING_HEADER_PREFIX = "x-anthropic-billing-header:"
+const CLAUDE_CODE_CCH_SEGMENT_PATTERN = /(^|;\s*)cch=[^;]+;/u
 
 type AnthropicAttachmentBlock = AnthropicImageBlock | AnthropicDocumentBlock
+type AnthropicMessageContentBlock =
+  | AnthropicUserContentBlock
+  | AnthropicAssistantContentBlock
+
+const createTextBlock = (text: string): AnthropicTextBlock => ({
+  type: "text",
+  text,
+})
+
+const appendTextSegment = (base: string, addition: string): string => {
+  if (base.length === 0) {
+    return addition
+  }
+  if (addition.length === 0) {
+    return base
+  }
+
+  return `${base}\n\n${addition}`
+}
+
+const ensureSystemReminderText = (text: string): string => {
+  if (text.startsWith(SYSTEM_REMINDER_START)) {
+    return text
+  }
+
+  return `${SYSTEM_REMINDER_START}\n${text.trim()}\n${SYSTEM_REMINDER_END}`
+}
+
+const normalizeSystemStringForMerge = (
+  text: string,
+): string | Array<AnthropicTextBlock> => {
+  if (!text.startsWith(SUBAGENT_START_HOOK_ADDITIONAL_PREFIX)) {
+    return ensureSystemReminderText(text)
+  }
+
+  const lineBreakMatch = /\r?\n/.exec(text)
+  if (!lineBreakMatch) {
+    return [createTextBlock(ensureSystemReminderText(text))]
+  }
+
+  const firstLine = text.slice(0, lineBreakMatch.index)
+  const rest = text.slice(lineBreakMatch.index + lineBreakMatch[0].length)
+  return [
+    createTextBlock(ensureSystemReminderText(firstLine)),
+    ...(rest.length > 0 ?
+      [createTextBlock(ensureSystemReminderText(rest))]
+    : []),
+  ]
+}
+
+const normalizeSystemContentForMerge = (
+  content: string | Array<AnthropicTextBlock>,
+): string | Array<AnthropicTextBlock> => {
+  if (typeof content === "string") {
+    return normalizeSystemStringForMerge(content)
+  }
+
+  return content.map((block) =>
+    block.text.startsWith(SYSTEM_REMINDER_START) ?
+      block
+    : {
+        ...block,
+        text: ensureSystemReminderText(block.text),
+      },
+  )
+}
+
+const toSystemTextBlocks = (
+  content: string | Array<AnthropicTextBlock>,
+): Array<AnthropicTextBlock> => {
+  return typeof content === "string" ? [createTextBlock(content)] : [...content]
+}
+
+const mergeSystemPromptContent = (
+  current: string | Array<AnthropicTextBlock> | undefined,
+  addition: string | Array<AnthropicTextBlock>,
+): string | Array<AnthropicTextBlock> => {
+  if (current === undefined) {
+    return typeof addition === "string" ? addition : [...addition]
+  }
+
+  if (typeof current === "string" && typeof addition === "string") {
+    return appendTextSegment(current, addition)
+  }
+
+  return [...toSystemTextBlocks(current), ...toSystemTextBlocks(addition)]
+}
+
+const prependSystemContentToUserMessage = (
+  message: AnthropicUserMessage,
+  addition: string | Array<AnthropicTextBlock>,
+): void => {
+  if (typeof message.content === "string" && typeof addition === "string") {
+    message.content = appendTextSegment(addition, message.content)
+    return
+  }
+
+  if (Array.isArray(message.content)) {
+    const lastToolResultIndex = message.content.findLastIndex(
+      (block) => block.type === "tool_result",
+    )
+    if (lastToolResultIndex >= 0) {
+      message.content = [
+        ...message.content.slice(0, lastToolResultIndex + 1),
+        ...toSystemTextBlocks(addition),
+        ...message.content.slice(lastToolResultIndex + 1),
+      ]
+      return
+    }
+  }
+
+  message.content = [
+    ...toSystemTextBlocks(addition),
+    ...(typeof message.content === "string" ?
+      [createTextBlock(message.content)]
+    : message.content),
+  ]
+}
+
+const normalizeClaudeCodeBillingHeader = (text: string): string => {
+  if (!text.startsWith(CLAUDE_CODE_BILLING_HEADER_PREFIX)) {
+    return text
+  }
+
+  return text.replace(CLAUDE_CODE_CCH_SEGMENT_PATTERN, "$1cch=<stable>;")
+}
+
+export const normalizeClaudeCodeBillingHeaderInSystem = (
+  payload: AnthropicMessagesPayload,
+): void => {
+  const system = payload.system
+  if (!system) {
+    return
+  }
+
+  if (typeof system === "string") {
+    payload.system = normalizeClaudeCodeBillingHeader(system)
+    return
+  }
+
+  if (system.length === 0) {
+    return
+  }
+
+  payload.system = system.map((block, index) =>
+    index === 0 ?
+      { ...block, text: normalizeClaudeCodeBillingHeader(block.text) }
+    : block,
+  )
+}
+
+export const normalizeSystemMessages = (
+  payload: AnthropicMessagesPayload,
+): void => {
+  normalizeClaudeCodeBillingHeaderInSystem(payload)
+
+  if (!payload.messages.some((msg) => msg.role === "system")) {
+    return
+  }
+
+  const normalizedMessages: Array<AnthropicMessage> = []
+  let system = payload.system
+
+  for (const message of payload.messages) {
+    if (message.role === "system") {
+      const normalizedContent = normalizeSystemContentForMerge(message.content)
+      const previousMessage = normalizedMessages.at(-1)
+      if (previousMessage?.role === "user") {
+        prependSystemContentToUserMessage(previousMessage, normalizedContent)
+      } else if (!previousMessage) {
+        system = mergeSystemPromptContent(system, normalizedContent)
+      }
+      continue
+    }
+
+    normalizedMessages.push(message)
+  }
+
+  payload.messages = normalizedMessages
+  payload.system = system
+}
+
+const isVersionAtLeast = (
+  version: string,
+  minimumMajor: number,
+  minimumMinor: number,
+): boolean => {
+  const [majorPart, minorPart = "0"] = version.split(".")
+  const major = Number.parseInt(majorPart, 10)
+  const minor = Number.parseInt(minorPart, 10)
+  if (!Number.isInteger(major) || !Number.isInteger(minor)) {
+    return false
+  }
+
+  return (
+    major > minimumMajor || (major === minimumMajor && minor >= minimumMinor)
+  )
+}
+
+const shouldSummarizeThinkingDisplayForModel = (model: string): boolean => {
+  const normalized = normalizeSdkModelId(model)
+  return Boolean(normalized && isVersionAtLeast(normalized.version, 4, 7))
+}
+
 type IndexedAttachment = {
   attachment: AnthropicAttachmentBlock
   order: number
 }
 
-const getCompactCandidateText = (message: AnthropicMessage): string => {
+const getBlockCacheControl = (
+  block: AnthropicMessageContentBlock | undefined,
+): AnthropicCacheControl | undefined => {
+  if (!block || block.type === "thinking") {
+    return undefined
+  }
+
+  const cacheControl = block.cache_control
+  if (!cacheControl || typeof cacheControl !== "object") {
+    return
+  }
+
+  return cacheControl
+}
+
+export const getLastMessageContentCacheControl = (
+  lastMessage: AnthropicInputMessage | undefined,
+): AnthropicCacheControl | undefined => {
+  if (!lastMessage || !Array.isArray(lastMessage.content)) {
+    return undefined
+  }
+
+  const cacheControl = getBlockCacheControl(lastMessage.content.at(-1))
+  return cacheControl ? { ...cacheControl } : undefined
+}
+
+// Apply the original last message tail's cache_control to the rewritten tail. If
+// the original tail was not marked, fall back to a default ephemeral marker.
+export const applyLastMessageCacheControl = (
+  anthropicPayload: AnthropicMessagesPayload,
+  lastMessageCacheControl: AnthropicCacheControl | undefined,
+): void => {
+  const cacheControl = lastMessageCacheControl ?? {
+    type: "ephemeral",
+  }
+
+  const lastMessage = anthropicPayload.messages.at(-1)
+  if (!lastMessage || !Array.isArray(lastMessage.content)) {
+    return
+  }
+
+  const lastBlock = lastMessage.content.at(-1)
+  if (!lastBlock || lastBlock.type === "thinking" || lastBlock.cache_control) {
+    return
+  }
+
+  lastBlock.cache_control = { ...cacheControl }
+}
+
+const getCompactCandidateText = (message: AnthropicInputMessage): string => {
   if (message.role !== "user") {
     return ""
   }
@@ -54,7 +320,7 @@ const getCompactCandidateText = (message: AnthropicMessage): string => {
     .join("\n\n")
 }
 
-const isCompactMessage = (lastMessage: AnthropicMessage): boolean => {
+const isCompactMessage = (lastMessage: AnthropicInputMessage): boolean => {
   const text = getCompactCandidateText(lastMessage)
   if (!text) {
     return false
@@ -68,7 +334,7 @@ const isCompactMessage = (lastMessage: AnthropicMessage): boolean => {
 }
 
 const isCompactAutoContinueMessage = (
-  lastMessage: AnthropicMessage,
+  lastMessage: AnthropicInputMessage,
 ): boolean => {
   const text = getCompactCandidateText(lastMessage)
   return (
@@ -114,6 +380,42 @@ export const getCompactType = (
   return 0
 }
 
+/**
+ * True for Claude Code background security-monitor requests: no tools,
+ * `stop_sequences: ["</block>"]`, and a system prompt starting with the
+ * security-monitor prefix. These can be rerouted via `claudeAutoModel`.
+ */
+export const isClaudeAutoModelRequest = (
+  payload: AnthropicMessagesPayload,
+): boolean => {
+  if (payload.tools && payload.tools.length > 0) {
+    return false
+  }
+
+  const stopSequences = payload.stop_sequences
+  if (
+    !Array.isArray(stopSequences)
+    || stopSequences.length !== 1
+    || stopSequences[0] !== claudeAutoModelStopSequence
+  ) {
+    return false
+  }
+
+  const system = payload.system
+  if (typeof system === "string") {
+    return system.startsWith(claudeAutoModelSystemPromptStart)
+  }
+  if (!Array.isArray(system)) {
+    return false
+  }
+
+  return system.some(
+    (block) =>
+      typeof block.text === "string"
+      && block.text.startsWith(claudeAutoModelSystemPromptStart),
+  )
+}
+
 const mergeContentWithText = (
   tr: AnthropicToolResultBlock,
   textBlock: AnthropicTextBlock,
@@ -127,7 +429,7 @@ const mergeContentWithText = (
   }
   return {
     ...tr,
-    content: [...tr.content, textBlock],
+    content: [...tr.content, stripContentBlockCacheControl(textBlock)],
   }
 }
 
@@ -143,24 +445,43 @@ const mergeContentWithTexts = (
   if (hasToolRef(tr)) {
     return tr
   }
-  return { ...tr, content: [...tr.content, ...textBlocks] }
+  return {
+    ...tr,
+    content: [...tr.content, ...textBlocks.map(stripContentBlockCacheControl)],
+  }
 }
 
 const mergeContentWithAttachments = (
   tr: AnthropicToolResultBlock,
   attachments: Array<AnthropicAttachmentBlock>,
 ): AnthropicToolResultBlock => {
+  const cleanAttachments = attachments.map(stripContentBlockCacheControl)
+
   if (typeof tr.content === "string") {
     return {
       ...tr,
-      content: [{ type: "text", text: tr.content }, ...attachments],
+      content: [{ type: "text", text: tr.content }, ...cleanAttachments],
     }
   }
 
   return {
     ...tr,
-    content: [...tr.content, ...attachments],
+    content: [...tr.content, ...cleanAttachments],
   }
+}
+
+const stripContentBlockCacheControl = <
+  T extends AnthropicToolResultContentBlock,
+>(
+  block: T,
+): T => {
+  if (!Object.hasOwn(block, "cache_control")) {
+    return block
+  }
+
+  const copy = { ...block }
+  delete copy.cache_control
+  return copy
 }
 
 const isAttachmentBlock = (
@@ -459,10 +780,6 @@ export const sanitizeIdeTools = (payload: AnthropicMessagesPayload): void => {
   }
 
   payload.tools = payload.tools.flatMap((tool) => {
-    if (tool.name === IDE_EXECUTE_CODE_TOOL && !tool.defer_loading) {
-      return []
-    }
-
     if (tool.name === IDE_GET_DIAGNOSTICS_TOOL) {
       return [
         {
@@ -489,14 +806,70 @@ const hasToolRef = (block: AnthropicToolResultBlock) => {
 const stripCacheControl = (payload: AnthropicMessagesPayload): void => {
   if (Array.isArray(payload.system)) {
     for (const block of payload.system) {
-      const systemBlock = block as AnthropicTextBlock & {
-        cache_control?: Record<string, unknown>
-      }
-      const cacheControl = systemBlock.cache_control
+      const cacheControl = block.cache_control
       if (cacheControl && typeof cacheControl === "object") {
         const { scope, ...rest } = cacheControl
-        systemBlock.cache_control = rest
+        block.cache_control = rest
       }
+    }
+  }
+}
+
+// Port top-level cache_control onto the last cacheable block as a lossless
+// polyfill, then drop the top-level field.
+const applyTopLevelCacheControl = (payload: AnthropicMessagesPayload): void => {
+  const topLevel = payload.cache_control
+  if (!topLevel || typeof topLevel !== "object") {
+    if (topLevel !== undefined) {
+      delete payload.cache_control
+    }
+    return
+  }
+
+  delete payload.cache_control
+
+  for (let m = payload.messages.length - 1; m >= 0; m--) {
+    const message = payload.messages[m]
+
+    if (typeof message.content === "string") {
+      message.content = [
+        {
+          type: "text",
+          text: message.content,
+          cache_control: { ...topLevel },
+        },
+      ]
+      return
+    }
+
+    if (!Array.isArray(message.content)) continue
+
+    for (let b = message.content.length - 1; b >= 0; b--) {
+      const block = message.content[b]
+      if (
+        block.type !== "text"
+        && block.type !== "image"
+        && block.type !== "tool_use"
+        && block.type !== "tool_result"
+      ) {
+        continue
+      }
+      block.cache_control ??= { ...topLevel }
+      return
+    }
+  }
+}
+
+// Strip per-tool eager_input_streaming.
+const stripToolEagerInputStreaming = (
+  payload: AnthropicMessagesPayload,
+): void => {
+  if (!payload.tools || payload.tools.length === 0) return
+
+  for (const tool of payload.tools) {
+    const extended = tool as typeof tool & { eager_input_streaming?: unknown }
+    if ("eager_input_streaming" in extended) {
+      delete extended.eager_input_streaming
     }
   }
 }
@@ -526,6 +899,8 @@ export const prepareMessagesApiPayload = (
   selectedModel?: Model,
 ): void => {
   stripCacheControl(payload)
+  applyTopLevelCacheControl(payload)
+  stripToolEagerInputStreaming(payload)
   filterAssistantThinkingBlocks(payload)
 
   const hasThinking = Boolean(payload.thinking)
@@ -543,19 +918,50 @@ export const prepareMessagesApiPayload = (
     if (!hasThinking) {
       payload.thinking.display = "summarized"
     }
-    if (payload.model === "claude-opus-4.7") {
+    if (shouldSummarizeThinkingDisplayForModel(payload.model)) {
       payload.thinking.display = "summarized"
     }
-    let effort = getReasoningEffortForModel(payload.model)
+    let effort =
+      payload.output_config?.effort ?? getReasoningEffortForModel(payload.model)
     if (effort === "none" || effort === "minimal") {
       effort = "low"
     }
     const reasoningEffort = selectedModel.capabilities.supports.reasoning_effort
     if (reasoningEffort && !reasoningEffort.includes(effort)) {
-      effort = reasoningEffort.at(-1) as "low" | "medium" | "high"
+      effort = reasoningEffort.at(-1) as
+        | "low"
+        | "medium"
+        | "high"
+        | "xhigh"
+        | "max"
     }
     payload.output_config = {
       effort: effort,
+    }
+  }
+
+  const modelSupports = selectedModel?.capabilities.supports
+  if (!modelSupports?.adaptive_thinking) {
+    const reasoningEfforts = modelSupports?.reasoning_effort
+    if (!reasoningEfforts || reasoningEfforts.length === 0) {
+      if (payload.output_config?.effort) {
+        delete payload.output_config.effort
+        if (Object.keys(payload.output_config).length === 0) {
+          delete payload.output_config
+        }
+      }
+    }
+
+    if (disableThink) {
+      delete payload.thinking
+    } else {
+      const budgetTokens = modelSupports?.max_thinking_budget ?? 4096
+      if (payload.thinking?.type === "adaptive") {
+        payload.thinking = {
+          type: "enabled",
+          budget_tokens: budgetTokens - 1,
+        }
+      }
     }
   }
 }

@@ -1,12 +1,17 @@
 import { Hono } from "hono"
 
-import { getProviderConfig } from "~/lib/config"
 import { forwardError } from "~/lib/error"
 import { createHandlerLogger } from "~/lib/logger"
+import { resolveProviderConfig } from "~/lib/provider-resolver"
+import {
+  handleCodexModelsProxy,
+  isCodexUserAgent,
+} from "~/routes/models/codex-models"
+import { getModels as getCodexModels } from "~/services/codex/get-models"
 import {
   createProviderProxyResponse,
   forwardProviderModels,
-} from "~/services/providers/anthropic-proxy"
+} from "~/services/providers/provider-proxy"
 
 const logger = createHandlerLogger("provider-models-handler")
 
@@ -16,7 +21,7 @@ providerModelRoutes.get("/", async (c) => {
   const provider = c.req.param("provider") ?? ""
 
   try {
-    const providerConfig = getProviderConfig(provider)
+    const providerConfig = await resolveProviderConfig(provider)
     if (!providerConfig) {
       return c.json(
         {
@@ -27,6 +32,19 @@ providerModelRoutes.get("/", async (c) => {
         },
         404,
       )
+    }
+
+    if (providerConfig.name === "codex") {
+      if (isCodexUserAgent(c.req.header("user-agent"))) {
+        return await handleCodexModelsProxy(c, providerConfig)
+      }
+
+      const models = getCodexModels()
+      return c.json({
+        object: "list",
+        data: models.data,
+        has_more: false,
+      })
     }
 
     const upstreamResponse = await forwardProviderModels(

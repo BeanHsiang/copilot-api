@@ -1,57 +1,71 @@
+import consola from "consola"
 import type { Context } from "hono"
 
 import { streamSSE, type SSEMessage } from "hono/streaming"
 
-import { awaitApproval } from "~/lib/approval"
-import { createHandlerLogger, debugJson, debugJsonTail } from "~/lib/logger"
-import { checkRateLimit } from "~/lib/rate-limit"
+import { resolveMappedModel } from "~/lib/config"
+import { createHandlerLogger, debugJson } from "~/lib/logger"
+import { parseProviderModelAlias } from "~/lib/provider-model"
 import { state } from "~/lib/state"
 import {
   createCopilotTokenUsageRecorder,
   normalizeOpenAIUsage,
+  normalizeOptionalToken,
   type UsageTokens,
 } from "~/lib/token-usage"
 import { generateRequestIdFromPayload, getUUID, isNullish } from "~/lib/utils"
-import {
-  createChatCompletions,
-  type ChatCompletionChunk,
-  type ChatCompletionResponse,
-  type ChatCompletionsPayload,
-} from "~/services/copilot/create-chat-completions"
+import { handleProviderChatCompletionsForProvider } from "~/routes/provider/chat-completions/handler"
+import type {
+  ChatCompletionChunk,
+  ChatCompletionResponse,
+  ChatCompletionsPayload,
+} from "~/lib/types/chat-completions"
+import { createChatCompletions } from "~/services/copilot/create-chat-completions"
 
 const logger = createHandlerLogger("chat-completions-handler")
 
 export async function handleCompletion(c: Context) {
-  await checkRateLimit(state)
-
   let payload = await c.req.json<ChatCompletionsPayload>()
-  debugJsonTail(logger, "Request payload:", { value: payload, tailLength: 400 })
+  const requestedModel = payload.model
+  payload.model = resolveMappedModel(payload.model)
+  if (payload.model !== requestedModel) {
+    consola.debug(
+      `Resolved model mapping: ${requestedModel} -> ${payload.model}`,
+    )
+  }
+
+  const providerModelAlias = parseProviderModelAlias(payload.model)
+  if (providerModelAlias) {
+    payload.model = providerModelAlias.model
+    return await handleProviderChatCompletionsForProvider(c, {
+      payload,
+      provider: providerModelAlias.provider,
+    })
+  }
+
+  debugJson(logger, "Request payload:", payload)
 
   // Find the selected model
   const selectedModel = state.models?.data.find(
     (model) => model.id === payload.model,
   )
 
-  if (selectedModel?.id === "gpt-5.4") {
-    return c.json(
-      {
-        error: {
-          message: "Please use `/v1/responses` or `/v1/messages` API",
-          type: "invalid_request_error",
-        },
-      },
-      400,
-    )
-  }
-
-  if (state.manualApprove) await awaitApproval()
-
-  if (isNullish(payload.max_tokens)) {
+  if (
+    isNullish(payload.max_tokens)
+    && isNullish(payload.max_completion_tokens)
+  ) {
     payload = {
       ...payload,
       max_tokens: selectedModel?.capabilities.limits.max_output_tokens,
     }
     debugJson(logger, "Set max_tokens to:", payload.max_tokens)
+  }
+
+  if (payload.model.includes("gpt")) {
+    if (isNullish(payload.max_completion_tokens)) {
+      payload.max_completion_tokens = payload.max_tokens
+    }
+    delete payload.max_tokens
   }
 
   // not support subagent marker for now , set sessionId = getUUID(requestId)
@@ -73,7 +87,12 @@ export async function handleCompletion(c: Context) {
 
   if (isNonStreaming(response)) {
     debugJson(logger, "Non-streaming response:", response)
-    recordUsage(normalizeOpenAIUsage(response.usage))
+    recordUsage({
+      ...normalizeOpenAIUsage(response.usage),
+      total_nano_aiu: normalizeOptionalToken(
+        response.copilot_usage?.total_nano_aiu,
+      ),
+    })
     return c.json(response)
   }
 
@@ -84,8 +103,13 @@ export async function handleCompletion(c: Context) {
     for await (const chunk of response) {
       debugJson(logger, "Streaming chunk:", chunk)
       const parsedChunk = parseChatCompletionChunk(chunk)
-      if (parsedChunk?.usage) {
-        usage = normalizeOpenAIUsage(parsedChunk.usage)
+      if (parsedChunk?.usage || parsedChunk?.copilot_usage) {
+        usage = {
+          ...normalizeOpenAIUsage(parsedChunk.usage),
+          total_nano_aiu: normalizeOptionalToken(
+            parsedChunk.copilot_usage?.total_nano_aiu,
+          ),
+        }
       }
       await stream.writeSSE(chunk as SSEMessage)
     }

@@ -1,5 +1,5 @@
 import type { ToolContentSupportType } from "~/lib/config"
-import type { Model } from "~/services/copilot/get-models"
+import type { Model } from "~/lib/types/models"
 
 import { state } from "~/lib/state"
 import {
@@ -10,12 +10,13 @@ import {
   type TextPart,
   type Tool,
   type ToolCall,
-} from "~/services/copilot/create-chat-completions"
+} from "~/lib/types/chat-completions"
 
 import {
   type AnthropicAssistantContentBlock,
   type AnthropicAssistantMessage,
   type AnthropicDocumentBlock,
+  type AnthropicMessage,
   type AnthropicMessagesPayload,
   type AnthropicResponse,
   type AnthropicTextBlock,
@@ -26,7 +27,7 @@ import {
   type AnthropicToolUseBlock,
   type AnthropicUserContentBlock,
   type AnthropicUserMessage,
-} from "./anthropic-types"
+} from "~/lib/types/anthropic"
 import { mapOpenAIStopReasonToAnthropic } from "./utils"
 
 // Compatible with opencode, it will filter out blocks where the thinking text is empty, so we need add a default thinking text
@@ -57,6 +58,8 @@ interface ToolResultMessages {
 interface TranslateToOpenAIOptions {
   supportPdf?: boolean
   toolContentSupportType?: Array<ToolContentSupportType>
+  validateReasoningEffort?: boolean
+  reasoningEffortSupport?: Array<string>
 }
 
 type MappableContentBlock =
@@ -72,6 +75,7 @@ export function translateToOpenAI(
   const modelId = payload.model
   const model = state.models?.data.find((m) => m.id === modelId)
   const thinkingBudget = getThinkingBudget(payload, model)
+  const reasoningEffort = getReasoningEffort(payload, options)
   const capabilities = {
     supportPdf: options.supportPdf ?? false,
     toolContentSupportType:
@@ -93,7 +97,33 @@ export function translateToOpenAI(
     tools: translateAnthropicToolsToOpenAI(payload.tools),
     tool_choice: translateAnthropicToolChoiceToOpenAI(payload.tool_choice),
     thinking_budget: thinkingBudget,
+    ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
   }
+}
+
+function getReasoningEffort(
+  payload: AnthropicMessagesPayload,
+  options: TranslateToOpenAIOptions,
+): string | undefined {
+  const effort = payload.output_config?.effort
+  if (!effort) {
+    return undefined
+  }
+
+  if (!options.validateReasoningEffort) {
+    return effort
+  }
+
+  const supportedEfforts = options.reasoningEffortSupport
+  if (!supportedEfforts || supportedEfforts.length === 0) {
+    return undefined
+  }
+
+  if (supportedEfforts.includes(effort)) {
+    return effort
+  }
+
+  return supportedEfforts.at(-1)
 }
 
 function getThinkingBudget(
@@ -101,7 +131,7 @@ function getThinkingBudget(
   model: Model | undefined,
 ): number | undefined {
   const thinking = payload.thinking
-  if (model && thinking) {
+  if (model && thinking?.budget_tokens !== undefined) {
     const maxThinkingBudget = Math.min(
       model.capabilities.supports.max_thinking_budget ?? 0,
       (model.capabilities.limits.max_output_tokens ?? 0) - 1,
@@ -124,10 +154,11 @@ function translateAnthropicMessagesToOpenAI(
   capabilities: TranslationCapabilities,
 ): Array<Message> {
   const systemMessages = handleSystemPrompt(payload.system)
-  const otherMessages = payload.messages.flatMap((message) =>
-    message.role === "user" ?
-      handleUserMessage(message, capabilities)
-    : handleAssistantMessage(message, modelId, capabilities),
+  const otherMessages = (payload.messages as Array<AnthropicMessage>).flatMap(
+    (message) =>
+      message.role === "user" ?
+        handleUserMessage(message, capabilities)
+      : handleAssistantMessage(message, modelId, capabilities),
   )
   return [...systemMessages, ...otherMessages]
 }
@@ -320,6 +351,11 @@ function handleAssistantMessage(
         content: mapContent(message.content),
       },
     ]
+  }
+
+  // Skip assistant messages with empty content array
+  if (message.content.length === 0) {
+    return []
   }
 
   const toolUseBlocks = message.content.filter(

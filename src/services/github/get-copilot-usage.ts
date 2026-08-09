@@ -1,3 +1,4 @@
+import consola from "consola"
 import { getGitHubApiBaseUrl, githubHeaders } from "~/lib/api-config"
 import { HTTPError } from "~/lib/error"
 import { state } from "~/lib/state"
@@ -6,10 +7,10 @@ export type CopilotAccountType = "individual" | "business" | "enterprise"
 
 export const getCopilotUsage = async (
   githubToken?: string,
-): Promise<CopilotUsageResponse> => {
+): Promise<CopilotUsageResponse | null> => {
   const resolvedGithubToken = githubToken ?? state.githubToken
   if (!resolvedGithubToken) {
-    throw new Error("GitHub token not found")
+    return null
   }
 
   const authState = { ...state, githubToken: resolvedGithubToken }
@@ -21,6 +22,9 @@ export const getCopilotUsage = async (
   )
 
   if (!response.ok) {
+    const errorText = await response.clone().text()
+    consola.error("Failed to get Copilot user response body", errorText)
+
     throw new HTTPError("Failed to get Copilot usage", response)
   }
 
@@ -31,6 +35,10 @@ export const getCopilotAccountType = async (
   githubToken?: string,
 ): Promise<CopilotAccountType> => {
   const usage = await getCopilotUsage(githubToken)
+  if (!usage) {
+    throw new Error("GitHub token not found")
+  }
+
   const plan = (usage.copilot_plan ?? "").toLowerCase()
 
   if (plan.includes("enterprise")) return "enterprise"
@@ -71,4 +79,5 @@ interface CopilotUsageResponse {
     api: string
     telemetry: string
   }
+  token_based_billing?: boolean
 }

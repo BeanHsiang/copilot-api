@@ -23,14 +23,28 @@ export type TokenUsagePeriod = "day" | "week" | "month"
 export interface UsageTokens {
   cache_creation_input_tokens?: number | null
   cache_read_input_tokens?: number | null
+  cost?: number | null
   input_tokens?: number | null
   output_tokens?: number | null
+  total_nano_aiu?: number | null
   total_tokens?: number | null
+}
+
+export interface TokenUsageCost {
+  amount: number
+  currency: string
+  total_cost_nanos: number
+}
+
+export interface TokenUsageEventCost extends TokenUsageCost {
+  source: string
 }
 
 export interface PersistedTokenUsageEvent {
   cache_creation_input_tokens: number
   cache_read_input_tokens: number
+  cost_currency: string | null
+  cost_source: string | null
   created_at_ms: number
   created_at_utc: string
   endpoint: TokenUsageEndpoint
@@ -40,6 +54,8 @@ export interface PersistedTokenUsageEvent {
   provider_name: string | null
   session_id: string
   source: TokenUsageSource
+  total_cost_nanos: number | null
+  total_nano_aiu: number | null
   total_tokens: number
   trace_id: string
   user_id: string
@@ -48,9 +64,11 @@ export interface PersistedTokenUsageEvent {
 export interface TokenUsageTotals {
   cache_creation_input_tokens: number
   cache_read_input_tokens: number
+  costs: Array<TokenUsageCost>
   input_tokens: number
   output_tokens: number
   request_count: number
+  total_nano_aiu: number | null
   total_tokens: number
 }
 
@@ -61,6 +79,7 @@ export interface TokenUsageModelSummary extends TokenUsageTotals {
 export interface TokenUsageEventRecord {
   cache_creation_input_tokens: number
   cache_read_input_tokens: number
+  cost: TokenUsageEventCost | null
   created_at_ms: number
   created_at_utc: string
   endpoint: TokenUsageEndpoint
@@ -71,6 +90,7 @@ export interface TokenUsageEventRecord {
   provider_name: string | null
   session_id: string
   source: TokenUsageSource
+  total_nano_aiu: number | null
   total_tokens: number
   trace_id: string
   user_id: string
@@ -78,6 +98,27 @@ export interface TokenUsageEventRecord {
 
 export interface TokenUsageSummary {
   byModel: Array<TokenUsageModelSummary>
+  period: TokenUsagePeriod
+  range: {
+    end_ms: number
+    end_utc: string
+    start_ms: number
+    start_utc: string
+  }
+  totals: TokenUsageTotals
+}
+
+export interface TokenUsageDailyBucket {
+  byModel: Array<TokenUsageModelSummary>
+  date: string
+  end_ms: number
+  start_ms: number
+  totals: TokenUsageTotals
+}
+
+export interface TokenUsageDailySummary {
+  byModel: Array<TokenUsageModelSummary>
+  days: Array<TokenUsageDailyBucket>
   period: TokenUsagePeriod
   range: {
     end_ms: number
@@ -105,6 +146,7 @@ export interface TokenUsageEventsPage {
 
 const DB_PATH_ENV = "COPILOT_API_SQLITE_DB_PATH"
 const DEFAULT_DB_FILENAME = "copilot-api.sqlite"
+const COST_NANOS_PER_UNIT = 1_000_000_000
 
 let writeQueue: Promise<void> = Promise.resolve()
 
@@ -146,11 +188,19 @@ function initializeTokenUsageDb(db: SqliteDatabase): void {
       output_tokens INTEGER NOT NULL DEFAULT 0,
       cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
       cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
-      total_tokens INTEGER NOT NULL DEFAULT 0
+      total_tokens INTEGER NOT NULL DEFAULT 0,
+      total_nano_aiu INTEGER,
+      cost_currency TEXT,
+      total_cost_nanos INTEGER,
+      cost_source TEXT
     )
   `)
   ensureColumn(db, "user_id", "TEXT NOT NULL DEFAULT ''")
   ensureColumn(db, "total_tokens", "INTEGER NOT NULL DEFAULT 0")
+  ensureColumn(db, "total_nano_aiu", "INTEGER")
+  ensureColumn(db, "cost_currency", "TEXT")
+  ensureColumn(db, "total_cost_nanos", "INTEGER")
+  ensureColumn(db, "cost_source", "TEXT")
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_token_usage_events_created_at_ms
     ON token_usage_events(created_at_ms)
@@ -209,6 +259,7 @@ export function hasAnyToken(tokens: UsageTokens): boolean {
     || normalizeToken(tokens.cache_read_input_tokens) > 0
     || normalizeToken(tokens.cache_creation_input_tokens) > 0
     || normalizeToken(tokens.total_tokens) > 0
+    || normalizeToken(tokens.total_nano_aiu) > 0
   )
 }
 
@@ -245,8 +296,12 @@ async function writeTokenUsageEvent(
         output_tokens,
         cache_read_input_tokens,
         cache_creation_input_tokens,
-        total_tokens
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        total_tokens,
+        total_nano_aiu,
+        cost_currency,
+        total_cost_nanos,
+        cost_source
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `,
   ).run(
     event.created_at_ms,
@@ -263,6 +318,10 @@ async function writeTokenUsageEvent(
     event.cache_read_input_tokens,
     event.cache_creation_input_tokens,
     event.total_tokens,
+    event.total_nano_aiu,
+    event.cost_currency,
+    event.total_cost_nanos,
+    event.cost_source,
   )
 }
 
@@ -291,21 +350,18 @@ async function flushTokenUsageEvents(): Promise<void> {
 
 function getPeriodRange(period: TokenUsagePeriod, now = new Date()) {
   const start = new Date(now)
+  start.setHours(0, 0, 0, 0)
 
   switch (period) {
     case "day": {
-      start.setHours(0, 0, 0, 0)
       break
     }
     case "week": {
-      const daysSinceMonday = (start.getDay() + 6) % 7
-      start.setDate(start.getDate() - daysSinceMonday)
-      start.setHours(0, 0, 0, 0)
+      start.setDate(start.getDate() - 6)
       break
     }
     case "month": {
-      start.setDate(1)
-      start.setHours(0, 0, 0, 0)
+      start.setDate(start.getDate() - 29)
       break
     }
     default: {
@@ -324,7 +380,7 @@ function getPeriodRange(period: TokenUsagePeriod, now = new Date()) {
       break
     }
     case "month": {
-      end.setMonth(end.getMonth() + 1)
+      end.setDate(end.getDate() + 30)
       break
     }
     default: {
@@ -338,15 +394,88 @@ function getPeriodRange(period: TokenUsagePeriod, now = new Date()) {
   }
 }
 
+function formatLocalDate(date: Date): string {
+  const year = date.getFullYear()
+  const month = String(date.getMonth() + 1).padStart(2, "0")
+  const day = String(date.getDate()).padStart(2, "0")
+  return `${year}-${month}-${day}`
+}
+
+function createDailyIntervals(range: { endMs: number; startMs: number }) {
+  const intervals: Array<{
+    date: string
+    endMs: number
+    startMs: number
+  }> = []
+  const cursor = new Date(range.startMs)
+
+  while (cursor.getTime() < range.endMs) {
+    const startMs = cursor.getTime()
+    const next = new Date(cursor)
+    next.setDate(next.getDate() + 1)
+    const endMs = Math.min(next.getTime(), range.endMs)
+    intervals.push({
+      date: formatLocalDate(cursor),
+      endMs,
+      startMs,
+    })
+    cursor.setTime(endMs)
+  }
+
+  return intervals
+}
+
 function createEmptyTotals(): TokenUsageTotals {
   return {
     cache_creation_input_tokens: 0,
     cache_read_input_tokens: 0,
+    costs: [],
     input_tokens: 0,
     output_tokens: 0,
     request_count: 0,
+    total_nano_aiu: null,
     total_tokens: 0,
   }
+}
+
+function addTotals(target: TokenUsageTotals, next: TokenUsageTotals): void {
+  target.cache_creation_input_tokens += next.cache_creation_input_tokens
+  target.cache_read_input_tokens += next.cache_read_input_tokens
+  target.costs = mergeCosts(target.costs, next.costs)
+  target.input_tokens += next.input_tokens
+  target.output_tokens += next.output_tokens
+  target.request_count += next.request_count
+  target.total_nano_aiu = addNullableNumbers(
+    target.total_nano_aiu,
+    next.total_nano_aiu,
+  )
+  target.total_tokens += next.total_tokens
+}
+
+function addNullableNumbers(
+  current: number | null,
+  next: number | null,
+): number | null {
+  if (current === null) return next
+  if (next === null) return current
+  return current + next
+}
+
+function mergeCosts(
+  current: Array<TokenUsageCost>,
+  next: Array<TokenUsageCost>,
+): Array<TokenUsageCost> {
+  const byCurrency = new Map<string, number>()
+  for (const cost of [...current, ...next]) {
+    byCurrency.set(
+      cost.currency,
+      (byCurrency.get(cost.currency) ?? 0) + cost.total_cost_nanos,
+    )
+  }
+
+  return [...byCurrency.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([currency, totalCostNanos]) => createCost(currency, totalCostNanos))
 }
 
 function createEmptySummary(period: TokenUsagePeriod): TokenUsageSummary {
@@ -354,6 +483,31 @@ function createEmptySummary(period: TokenUsagePeriod): TokenUsageSummary {
 
   return {
     byModel: [],
+    period,
+    range: {
+      end_ms: range.endMs,
+      end_utc: new Date(range.endMs).toISOString(),
+      start_ms: range.startMs,
+      start_utc: new Date(range.startMs).toISOString(),
+    },
+    totals: createEmptyTotals(),
+  }
+}
+
+function createEmptyDailySummary(
+  period: TokenUsagePeriod,
+): TokenUsageDailySummary {
+  const range = getPeriodRange(period)
+
+  return {
+    byModel: [],
+    days: createDailyIntervals(range).map((interval) => ({
+      byModel: [],
+      date: interval.date,
+      end_ms: interval.endMs,
+      start_ms: interval.startMs,
+      totals: createEmptyTotals(),
+    })),
     period,
     range: {
       end_ms: range.endMs,
@@ -390,6 +544,15 @@ function createEmptyEventsPage(input: {
   }
 }
 
+function rangePayload(range: { endMs: number; startMs: number }) {
+  return {
+    end_ms: range.endMs,
+    end_utc: new Date(range.endMs).toISOString(),
+    start_ms: range.startMs,
+    start_utc: new Date(range.startMs).toISOString(),
+  }
+}
+
 function numberFromRow(
   row: Record<string, unknown> | undefined,
   key: string,
@@ -398,8 +561,55 @@ function numberFromRow(
   return typeof value === "number" && Number.isFinite(value) ? value : 0
 }
 
+function nullableNumberFromRow(
+  row: Record<string, unknown> | undefined,
+  key: string,
+): number | null {
+  const value = row?.[key]
+  return typeof value === "number" && Number.isFinite(value) ? value : null
+}
+
+function createCost(currency: string, totalCostNanos: number): TokenUsageCost {
+  return {
+    amount: totalCostNanos / COST_NANOS_PER_UNIT,
+    currency,
+    total_cost_nanos: totalCostNanos,
+  }
+}
+
+function costFromRow(row: Record<string, unknown>): TokenUsageCost | null {
+  const currency = row.cost_currency
+  const totalCostNanos = row.total_cost_nanos
+  if (
+    typeof currency !== "string"
+    || !currency
+    || typeof totalCostNanos !== "number"
+    || !Number.isFinite(totalCostNanos)
+  ) {
+    return null
+  }
+
+  return createCost(currency, totalCostNanos)
+}
+
+function eventCostFromRow(
+  row: Record<string, unknown>,
+): TokenUsageEventCost | null {
+  const cost = costFromRow(row)
+  const source = row.cost_source
+  if (!cost || typeof source !== "string" || !source) {
+    return null
+  }
+
+  return {
+    ...cost,
+    source,
+  }
+}
+
 function totalsFromRow(
   row: Record<string, unknown> | undefined,
+  costs: Array<TokenUsageCost> = [],
 ): TokenUsageTotals {
   return {
     cache_creation_input_tokens: numberFromRow(
@@ -407,10 +617,22 @@ function totalsFromRow(
       "cache_creation_input_tokens",
     ),
     cache_read_input_tokens: numberFromRow(row, "cache_read_input_tokens"),
+    costs,
     input_tokens: numberFromRow(row, "input_tokens"),
     output_tokens: numberFromRow(row, "output_tokens"),
     request_count: numberFromRow(row, "request_count"),
+    total_nano_aiu: nullableNumberFromRow(row, "total_nano_aiu"),
     total_tokens: numberFromRow(row, "total_tokens"),
+  }
+}
+
+function modelSummaryFromRow(
+  row: Record<string, unknown>,
+  costs: Array<TokenUsageCost> = [],
+): TokenUsageModelSummary {
+  return {
+    ...totalsFromRow(row, costs),
+    model: typeof row.model === "string" ? row.model : "unknown",
   }
 }
 
@@ -436,6 +658,7 @@ function usageEventFromRow(
       "cache_creation_input_tokens",
     ),
     cache_read_input_tokens: numberFromRow(row, "cache_read_input_tokens"),
+    cost: eventCostFromRow(row),
     created_at_ms: numberFromRow(row, "created_at_ms"),
     created_at_utc: stringFromRow(row, "created_at_utc"),
     endpoint: stringFromRow(row, "endpoint") as TokenUsageEndpoint,
@@ -446,9 +669,152 @@ function usageEventFromRow(
     provider_name: nullableStringFromRow(row, "provider_name"),
     session_id: stringFromRow(row, "session_id"),
     source: stringFromRow(row, "source") as TokenUsageSource,
+    total_nano_aiu: nullableNumberFromRow(row, "total_nano_aiu"),
     total_tokens: numberFromRow(row, "total_tokens"),
     trace_id: stringFromRow(row, "trace_id"),
     user_id: stringFromRow(row, "user_id"),
+  }
+}
+
+function getTotalsRow(
+  db: SqliteDatabase,
+  range: { endMs: number; startMs: number },
+): Record<string, unknown> | undefined {
+  return db
+    .prepare(
+      `
+    SELECT
+      COUNT(*) AS request_count,
+      COALESCE(SUM(input_tokens), 0) AS input_tokens,
+      COALESCE(SUM(output_tokens), 0) AS output_tokens,
+      COALESCE(SUM(cache_read_input_tokens), 0) AS cache_read_input_tokens,
+      COALESCE(SUM(cache_creation_input_tokens), 0) AS cache_creation_input_tokens,
+      SUM(total_nano_aiu) AS total_nano_aiu,
+      COALESCE(SUM(total_tokens), 0) AS total_tokens
+    FROM token_usage_events
+    WHERE created_at_ms >= ? AND created_at_ms < ?
+  `,
+    )
+    .get(range.startMs, range.endMs) as Record<string, unknown> | undefined
+}
+
+function getModelRows(
+  db: SqliteDatabase,
+  range: { endMs: number; startMs: number },
+): Array<Record<string, unknown>> {
+  return db
+    .prepare(
+      `
+    SELECT
+      model,
+      COUNT(*) AS request_count,
+      COALESCE(SUM(input_tokens), 0) AS input_tokens,
+      COALESCE(SUM(output_tokens), 0) AS output_tokens,
+      COALESCE(SUM(cache_read_input_tokens), 0) AS cache_read_input_tokens,
+      COALESCE(SUM(cache_creation_input_tokens), 0) AS cache_creation_input_tokens,
+      SUM(total_nano_aiu) AS total_nano_aiu,
+      COALESCE(SUM(total_tokens), 0) AS total_tokens
+    FROM token_usage_events
+    WHERE created_at_ms >= ? AND created_at_ms < ?
+    GROUP BY model
+    ORDER BY
+      total_tokens DESC,
+      model ASC
+  `,
+    )
+    .all(range.startMs, range.endMs) as Array<Record<string, unknown>>
+}
+
+function getCostRows(
+  db: SqliteDatabase,
+  range: { endMs: number; startMs: number },
+): Array<TokenUsageCost> {
+  const rows = db
+    .prepare(
+      `
+    SELECT
+      cost_currency,
+      COALESCE(SUM(total_cost_nanos), 0) AS total_cost_nanos
+    FROM token_usage_events
+    WHERE
+      created_at_ms >= ?
+      AND created_at_ms < ?
+      AND cost_currency IS NOT NULL
+      AND total_cost_nanos IS NOT NULL
+    GROUP BY cost_currency
+    ORDER BY cost_currency ASC
+  `,
+    )
+    .all(range.startMs, range.endMs) as Array<Record<string, unknown>>
+
+  return rows.flatMap((row) => {
+    const cost = costFromRow(row)
+    return cost ? [cost] : []
+  })
+}
+
+function getModelCostMap(
+  db: SqliteDatabase,
+  range: { endMs: number; startMs: number },
+): Map<string, Array<TokenUsageCost>> {
+  const rows = db
+    .prepare(
+      `
+    SELECT
+      model,
+      cost_currency,
+      COALESCE(SUM(total_cost_nanos), 0) AS total_cost_nanos
+    FROM token_usage_events
+    WHERE
+      created_at_ms >= ?
+      AND created_at_ms < ?
+      AND cost_currency IS NOT NULL
+      AND total_cost_nanos IS NOT NULL
+    GROUP BY model, cost_currency
+    ORDER BY model ASC, cost_currency ASC
+  `,
+    )
+    .all(range.startMs, range.endMs) as Array<Record<string, unknown>>
+
+  const costMap = new Map<string, Array<TokenUsageCost>>()
+  for (const row of rows) {
+    const model = stringFromRow(row, "model") || "unknown"
+    const cost = costFromRow(row)
+    if (!cost) {
+      continue
+    }
+    costMap.set(model, [...(costMap.get(model) ?? []), cost])
+  }
+
+  return costMap
+}
+
+function getModelSummaries(
+  db: SqliteDatabase,
+  range: { endMs: number; startMs: number },
+): Array<TokenUsageModelSummary> {
+  const costMap = getModelCostMap(db, range)
+  return getModelRows(db, range).map((row) => {
+    const model = stringFromRow(row, "model") || "unknown"
+    return modelSummaryFromRow(row, costMap.get(model) ?? [])
+  })
+}
+
+function createDailyBucket(
+  interval: { date: string; endMs: number; startMs: number },
+  byModel: Array<TokenUsageModelSummary>,
+): TokenUsageDailyBucket {
+  const totals = createEmptyTotals()
+  for (const model of byModel) {
+    addTotals(totals, model)
+  }
+
+  return {
+    byModel,
+    date: interval.date,
+    end_ms: interval.endMs,
+    start_ms: interval.startMs,
+    totals,
   }
 }
 
@@ -462,56 +828,36 @@ export async function getTokenUsageSummary(
   await flushTokenUsageEvents()
   const range = getPeriodRange(period)
   const db = await getDb()
-  const totalsRow = db
-    .prepare(
-      `
-    SELECT
-      COUNT(*) AS request_count,
-      COALESCE(SUM(input_tokens), 0) AS input_tokens,
-      COALESCE(SUM(output_tokens), 0) AS output_tokens,
-      COALESCE(SUM(cache_read_input_tokens), 0) AS cache_read_input_tokens,
-      COALESCE(SUM(cache_creation_input_tokens), 0) AS cache_creation_input_tokens,
-      COALESCE(SUM(total_tokens), 0) AS total_tokens
-    FROM token_usage_events
-    WHERE created_at_ms >= ? AND created_at_ms < ?
-  `,
-    )
-    .get(range.startMs, range.endMs) as Record<string, unknown> | undefined
-
-  const byModelRows = db
-    .prepare(
-      `
-    SELECT
-      model,
-      COUNT(*) AS request_count,
-      COALESCE(SUM(input_tokens), 0) AS input_tokens,
-      COALESCE(SUM(output_tokens), 0) AS output_tokens,
-      COALESCE(SUM(cache_read_input_tokens), 0) AS cache_read_input_tokens,
-      COALESCE(SUM(cache_creation_input_tokens), 0) AS cache_creation_input_tokens,
-      COALESCE(SUM(total_tokens), 0) AS total_tokens
-    FROM token_usage_events
-    WHERE created_at_ms >= ? AND created_at_ms < ?
-    GROUP BY model
-    ORDER BY
-      total_tokens DESC,
-      model ASC
-  `,
-    )
-    .all(range.startMs, range.endMs) as Array<Record<string, unknown>>
+  const totalsRow = getTotalsRow(db, range)
 
   return {
-    byModel: byModelRows.map((row) => ({
-      ...totalsFromRow(row),
-      model: typeof row.model === "string" ? row.model : "unknown",
-    })),
+    byModel: getModelSummaries(db, range),
     period,
-    range: {
-      end_ms: range.endMs,
-      end_utc: new Date(range.endMs).toISOString(),
-      start_ms: range.startMs,
-      start_utc: new Date(range.startMs).toISOString(),
-    },
-    totals: totalsFromRow(totalsRow),
+    range: rangePayload(range),
+    totals: totalsFromRow(totalsRow, getCostRows(db, range)),
+  }
+}
+
+export async function getTokenUsageDailySummary(
+  period: TokenUsagePeriod,
+): Promise<TokenUsageDailySummary> {
+  if (!isTokenUsageStorageEnabled()) {
+    return createEmptyDailySummary(period)
+  }
+
+  await flushTokenUsageEvents()
+  const range = getPeriodRange(period)
+  const db = await getDb()
+  const intervals = createDailyIntervals(range)
+
+  return {
+    byModel: getModelSummaries(db, range),
+    days: intervals.map((interval) =>
+      createDailyBucket(interval, getModelSummaries(db, interval)),
+    ),
+    period,
+    range: rangePayload(range),
+    totals: totalsFromRow(getTotalsRow(db, range), getCostRows(db, range)),
   }
 }
 
@@ -559,7 +905,11 @@ export async function getTokenUsageEventsPage(input: {
       output_tokens,
       cache_read_input_tokens,
       cache_creation_input_tokens,
-      total_tokens
+      total_nano_aiu,
+      total_tokens,
+      cost_currency,
+      total_cost_nanos,
+      cost_source
     FROM token_usage_events
     WHERE created_at_ms >= ? AND created_at_ms < ?
     ORDER BY created_at_ms DESC, id DESC

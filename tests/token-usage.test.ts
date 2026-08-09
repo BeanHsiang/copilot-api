@@ -1,4 +1,11 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test"
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  setSystemTime,
+  test,
+} from "bun:test"
 import { Hono } from "hono"
 
 import { requestContext } from "~/lib/request-context"
@@ -8,9 +15,11 @@ import {
   createCopilotTokenUsageRecorder,
   normalizeOpenAIUsage,
   recordTokenUsageEvent,
+  type TokenUsageDailySummary,
   type TokenUsageEventsPage,
   type TokenUsageSummary,
 } from "~/lib/token-usage"
+import { resolveTokenUsageCost } from "~/lib/token-usage/pricing"
 import { traceIdMiddleware } from "~/lib/trace"
 import { tokenUsageRoute } from "~/routes/token-usage/route"
 
@@ -24,6 +33,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
   await closeUsageStore()
+  setSystemTime()
   state.userName = undefined
   Reflect.deleteProperty(process.env, DB_PATH_ENV)
 })
@@ -41,6 +51,17 @@ async function fetchEventsPage(pageSize = 20): Promise<TokenUsageEventsPage> {
   )
   expect(response.status).toBe(200)
   return (await response.json()) as TokenUsageEventsPage
+}
+
+function localDate(year: number, month: number, day: number, hour = 12): Date {
+  return new Date(year, month, day, hour, 0, 0, 0)
+}
+
+function localDateLabel(date: Date): string {
+  const year = date.getFullYear()
+  const month = String(date.getMonth() + 1).padStart(2, "0")
+  const day = String(date.getDate()).padStart(2, "0")
+  return `${year}-${month}-${day}`
 }
 
 describe("token usage storage", () => {
@@ -139,6 +160,7 @@ describe("token usage storage", () => {
       model: "gpt-a",
       output_tokens: 3,
       source: "copilot",
+      total_nano_aiu: 1000,
     })
     recordTokenUsageEvent({
       cache_read_input_tokens: 4,
@@ -147,6 +169,7 @@ describe("token usage storage", () => {
       model: "gpt-b",
       output_tokens: 6,
       source: "copilot",
+      total_nano_aiu: 2500,
     })
 
     const response = await createTokenUsageApp().request(
@@ -158,14 +181,26 @@ describe("token usage storage", () => {
     expect(summary.totals).toEqual({
       cache_creation_input_tokens: 1,
       cache_read_input_tokens: 6,
+      costs: [
+        {
+          amount: 0.000000035,
+          currency: "USD",
+          total_cost_nanos: 35,
+        },
+      ],
       input_tokens: 30,
       output_tokens: 9,
       request_count: 2,
+      total_nano_aiu: 3500,
       total_tokens: 46,
     })
     expect(summary.totals.total_tokens).toBe(46)
+    expect(summary.totals.total_nano_aiu).toBe(3500)
     expect(summary.byModel).toHaveLength(2)
     expect(summary.byModel.every((row) => row.total_tokens > 0)).toBe(true)
+    expect(summary.byModel.map((row) => row.total_nano_aiu)).toEqual([
+      2500, 1000,
+    ])
   })
 
   test("returns paginated usage events with user id", async () => {
@@ -175,6 +210,7 @@ describe("token usage storage", () => {
       model: "gpt-a",
       output_tokens: 2,
       source: "copilot",
+      total_nano_aiu: 1200,
     })
     recordTokenUsageEvent({
       endpoint: "provider_messages",
@@ -198,10 +234,245 @@ describe("token usage storage", () => {
     expect(page.page_size).toBe(1)
     expect(page.total_pages).toBe(2)
     expect(page.items).toHaveLength(1)
+    expect(page.items[0]?.total_nano_aiu).toBe(null)
     expect(page.items[0]?.user_id).toBe("anthropic")
     expect(page.items[0]?.trace_id).toBe("trace-provider")
     expect(page.items[0]?.session_id).toBe("claude-session")
     expect(page.items[0]?.total_tokens).toBe(25)
+  })
+
+  test("calculates built-in Codex GPT-5.6 prices with cached input discount", async () => {
+    const expectedCosts = [
+      { model: "gpt-5.6-sol", totalCostNanos: 96_000_000 },
+      { model: "gpt-5.6-terra", totalCostNanos: 38_400_000 },
+      { model: "gpt-5.6-luna", totalCostNanos: 3_840_000 },
+    ]
+
+    for (const { model } of expectedCosts) {
+      recordTokenUsageEvent({
+        cache_read_input_tokens: 2_000,
+        endpoint: "responses",
+        input_tokens: 1_000,
+        model,
+        output_tokens: 3_000,
+        providerName: "codex",
+        source: "provider",
+      })
+    }
+
+    const page = await fetchEventsPage(10)
+    const costsByModel = new Map(
+      page.items.map((item) => [item.model, item.cost]),
+    )
+
+    for (const { model, totalCostNanos } of expectedCosts) {
+      const cost = costsByModel.get(model)
+      expect(cost?.currency).toBe("USD")
+      expect(cost?.source).toBe("builtin")
+      expect(cost?.total_cost_nanos).toBe(totalCostNanos)
+    }
+
+    const response = await createTokenUsageApp().request(
+      "/token-usage?period=day",
+    )
+    expect(response.status).toBe(200)
+    const summary = (await response.json()) as TokenUsageSummary
+    expect(summary.totals.costs).toEqual([
+      {
+        amount: 0.13824,
+        currency: "USD",
+        total_cost_nanos: 138_240_000,
+      },
+    ])
+  })
+
+  test("records provider-reported cost before configured pricing", async () => {
+    recordTokenUsageEvent({
+      cost: 0.0002928408,
+      endpoint: "provider_messages",
+      input_tokens: 853,
+      model: "claude-sonnet-4",
+      output_tokens: 284,
+      pricing: {
+        input: 100,
+        output: 100,
+      },
+      pricingCurrency: "USD",
+      providerName: "openrouter",
+      source: "provider",
+    })
+
+    const page = await fetchEventsPage()
+    expect(page.items[0]?.cost).toEqual({
+      amount: 0.000292841,
+      currency: "USD",
+      source: "upstream",
+      total_cost_nanos: 292_841,
+    })
+  })
+
+  test("does not use provider-reported cost for non-OpenRouter providers", () => {
+    expect(
+      resolveTokenUsageCost({
+        cost: 0.0002928408,
+        input_tokens: 10,
+        model: "custom-model",
+        output_tokens: 5,
+        pricing: {
+          input: 1,
+          output: 2,
+        },
+        pricingCurrency: "USD",
+        providerName: "anthropic",
+        source: "provider",
+      }),
+    ).toEqual({
+      currency: "USD",
+      source: "config",
+      total_cost_nanos: 20_000,
+    })
+  })
+
+  test("uses GPT-5.6 Terra and Luna long-context and cache-write prices", () => {
+    const expectedCosts = [
+      { model: "gpt-5.6-terra", totalCostNanos: 1_140_800_000 },
+      { model: "gpt-5.6-luna", totalCostNanos: 114_080_000 },
+    ]
+
+    for (const { model, totalCostNanos } of expectedCosts) {
+      expect(
+        resolveTokenUsageCost({
+          cache_creation_input_tokens: 2_000,
+          cache_read_input_tokens: 2_000,
+          input_tokens: 269_000,
+          model,
+          output_tokens: 3_000,
+          providerName: "codex",
+          source: "provider",
+        }),
+      ).toEqual({
+        currency: "USD",
+        source: "builtin",
+        total_cost_nanos: totalCostNanos,
+      })
+    }
+  })
+
+  test("prices OpenCode Go Hy3 and GPT-5.6 Luna with long-context tiers", () => {
+    const shortContextCosts = [
+      { model: "hy3", totalCostNanos: 1_950_000 },
+      { model: "gpt-5.6-luna", totalCostNanos: 2_045_000 },
+      { model: "qwen3.8-max", totalCostNanos: 23_000_000 },
+    ]
+
+    for (const { model, totalCostNanos } of shortContextCosts) {
+      expect(
+        resolveTokenUsageCost({
+          cache_creation_input_tokens: 1_000,
+          cache_read_input_tokens: 2_000,
+          input_tokens: 1_000,
+          model,
+          output_tokens: 3_000,
+          providerName: "opencode-go",
+          source: "provider",
+        }),
+      ).toEqual({
+        currency: "USD",
+        source: "builtin",
+        total_cost_nanos: totalCostNanos,
+      })
+    }
+
+    expect(
+      resolveTokenUsageCost({
+        cache_creation_input_tokens: 2_000,
+        cache_read_input_tokens: 2_000,
+        input_tokens: 269_000,
+        model: "gpt-5.6-luna",
+        output_tokens: 3_000,
+        providerName: "opencode-go",
+        source: "provider",
+      }),
+    ).toEqual({
+      currency: "USD",
+      source: "builtin",
+      total_cost_nanos: 57_040_000,
+    })
+  })
+
+  test("prices DashScope Qwen3.8 Max with explicit cache prices", () => {
+    expect(
+      resolveTokenUsageCost({
+        cache_creation_input_tokens: 1_000,
+        cache_read_input_tokens: 2_000,
+        input_tokens: 1_000,
+        model: "qwen3.8-max",
+        output_tokens: 3_000,
+        providerName: "dashscope",
+        source: "provider",
+      }),
+    ).toEqual({
+      currency: "CNY",
+      source: "builtin",
+      total_cost_nanos: 137_000_000,
+    })
+  })
+
+  test("prices DashScope DeepSeek V4 Flash 0731 with cached input", () => {
+    expect(
+      resolveTokenUsageCost({
+        cache_read_input_tokens: 2_000,
+        input_tokens: 1_000,
+        model: "deepseek-v4-flash-0731",
+        output_tokens: 3_000,
+        providerName: "dashscope",
+        source: "provider",
+      }),
+    ).toEqual({
+      currency: "CNY",
+      source: "builtin",
+      total_cost_nanos: 7_400_000,
+    })
+  })
+
+  test("prices Kimi models in USD and DashScope Kimi in CNY", () => {
+    const expectedCosts = [
+      {
+        currency: "USD",
+        model: "k3",
+        providerName: "kimi",
+        totalCostNanos: 48_600_000,
+      },
+      {
+        currency: "USD",
+        model: "k3-256k",
+        providerName: "kimi",
+        totalCostNanos: 48_600_000,
+      },
+      {
+        currency: "CNY",
+        model: "kimi/kimi-k3",
+        providerName: "dashscope",
+        totalCostNanos: 324_000_000,
+      },
+    ]
+
+    for (const expected of expectedCosts) {
+      expect(
+        resolveTokenUsageCost({
+          cache_read_input_tokens: 2_000,
+          input_tokens: 1_000,
+          model: expected.model,
+          output_tokens: 3_000,
+          providerName: expected.providerName,
+          source: "provider",
+        }),
+      ).toEqual({
+        currency: expected.currency,
+        source: "builtin",
+        total_cost_nanos: expected.totalCostNanos,
+      })
+    }
   })
 
   test("only falls back to interaction id when no real session id exists", async () => {
@@ -228,5 +499,131 @@ describe("token usage storage", () => {
     expect(page.items).toHaveLength(2)
     expect(page.items[0]?.session_id).toBe("real-session")
     expect(page.items[1]?.session_id).toBe("interaction-session")
+  })
+
+  test("returns daily token usage buckets by model with total tokens", async () => {
+    setSystemTime(localDate(2026, 4, 8))
+    recordTokenUsageEvent({
+      endpoint: "chat_completions",
+      input_tokens: 999,
+      model: "outside-week",
+      output_tokens: 1,
+      source: "copilot",
+    })
+
+    setSystemTime(localDate(2026, 4, 12, 10))
+    recordTokenUsageEvent({
+      cache_creation_input_tokens: 1,
+      cache_read_input_tokens: 2,
+      endpoint: "chat_completions",
+      input_tokens: 10,
+      model: "gpt-a",
+      output_tokens: 3,
+      source: "copilot",
+      total_nano_aiu: 100,
+    })
+    recordTokenUsageEvent({
+      cache_read_input_tokens: 4,
+      endpoint: "responses",
+      input_tokens: 20,
+      model: "gpt-b",
+      output_tokens: 5,
+      source: "copilot",
+      total_nano_aiu: 200,
+    })
+
+    setSystemTime(localDate(2026, 4, 14, 9))
+    recordTokenUsageEvent({
+      endpoint: "messages",
+      input_tokens: 6,
+      model: "gpt-a",
+      output_tokens: 4,
+      source: "copilot",
+      total_nano_aiu: 300,
+      total_tokens: 100,
+    })
+
+    setSystemTime(localDate(2026, 4, 15))
+    const response = await createTokenUsageApp().request(
+      "/token-usage/daily?period=week",
+    )
+    expect(response.status).toBe(200)
+
+    const daily = (await response.json()) as TokenUsageDailySummary
+    expect(daily.period).toBe("week")
+    expect(daily.days).toHaveLength(7)
+    expect(daily.totals).toEqual({
+      cache_creation_input_tokens: 1,
+      cache_read_input_tokens: 6,
+      costs: [
+        {
+          amount: 0.000000006,
+          currency: "USD",
+          total_cost_nanos: 6,
+        },
+      ],
+      input_tokens: 36,
+      output_tokens: 12,
+      request_count: 3,
+      total_nano_aiu: 600,
+      total_tokens: 145,
+    })
+    expect(daily.byModel.map((model) => model.model)).toEqual([
+      "gpt-a",
+      "gpt-b",
+    ])
+    expect(daily.byModel[0]?.total_tokens).toBe(116)
+    expect(daily.byModel[0]?.total_nano_aiu).toBe(400)
+
+    const firstDay = daily.days[0]
+    expect(firstDay?.date).toBe(localDateLabel(localDate(2026, 4, 9)))
+    expect(firstDay?.totals.total_tokens).toBe(0)
+
+    const may12 = daily.days.find(
+      (day) => day.date === localDateLabel(localDate(2026, 4, 12)),
+    )
+    expect(may12?.totals).toEqual({
+      cache_creation_input_tokens: 1,
+      cache_read_input_tokens: 6,
+      costs: [
+        {
+          amount: 0.000000003,
+          currency: "USD",
+          total_cost_nanos: 3,
+        },
+      ],
+      input_tokens: 30,
+      output_tokens: 8,
+      request_count: 2,
+      total_nano_aiu: 300,
+      total_tokens: 45,
+    })
+    expect(may12?.byModel.map((model) => model.model)).toEqual([
+      "gpt-b",
+      "gpt-a",
+    ])
+
+    const may14 = daily.days.find(
+      (day) => day.date === localDateLabel(localDate(2026, 4, 14)),
+    )
+    expect(may14?.totals.total_tokens).toBe(100)
+    expect(may14?.byModel[0]?.model).toBe("gpt-a")
+    expect(may14?.byModel[0]?.total_tokens).toBe(100)
+  })
+
+  test("returns empty daily buckets and falls back invalid period to day", async () => {
+    setSystemTime(localDate(2026, 4, 15))
+    const response = await createTokenUsageApp().request(
+      "/token-usage/daily?period=invalid",
+    )
+    expect(response.status).toBe(200)
+
+    const daily = (await response.json()) as TokenUsageDailySummary
+    expect(daily.period).toBe("day")
+    expect(daily.days).toHaveLength(1)
+    expect(daily.days[0]?.date).toBe(localDateLabel(localDate(2026, 4, 15)))
+    expect(daily.days[0]?.totals.total_tokens).toBe(0)
+    expect(daily.byModel).toEqual([])
+    expect(daily.totals.request_count).toBe(0)
   })
 })

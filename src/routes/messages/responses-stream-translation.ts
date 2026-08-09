@@ -1,4 +1,8 @@
 import {
+  BRIDGE_TOOL_SEARCH_NAME,
+  formatToolSearchBridgeArguments,
+} from "~/lib/tool-search"
+import {
   type ResponseCompletedEvent,
   type ResponseCreatedEvent,
   type ResponseErrorEvent,
@@ -8,18 +12,20 @@ import {
   type ResponseIncompleteEvent,
   type ResponseOutputItemAddedEvent,
   type ResponseOutputItemDoneEvent,
+  type ResponseReasoningSummaryPartAddedEvent,
   type ResponseReasoningSummaryTextDeltaEvent,
   type ResponseReasoningSummaryTextDoneEvent,
   type ResponsesResult,
   type ResponseStreamEvent,
   type ResponseTextDeltaEvent,
   type ResponseTextDoneEvent,
-} from "~/services/copilot/create-responses"
+} from "~/lib/types/responses"
 
-import { type AnthropicStreamEventData } from "./anthropic-types"
+import { type AnthropicStreamEventData } from "~/lib/types/anthropic"
 import {
-  THINKING_TEXT,
+  REASONING_SUMMARY_SEPARATOR,
   encodeCompactionCarrierSignature,
+  resolveToolUseName,
   translateResponsesResultToAnthropic,
 } from "./responses-translation"
 
@@ -65,7 +71,10 @@ export interface ResponsesStreamState {
   blockIndexByKey: Map<string, number>
   openBlocks: Set<number>
   blockHasDelta: Set<number>
+  reasoningSummaryHasDelta: Set<string>
   functionCallStateByOutputIndex: Map<number, FunctionCallStreamState>
+  toolSearchName: string
+  hasToolCall: boolean
 }
 
 type FunctionCallStreamState = {
@@ -75,14 +84,19 @@ type FunctionCallStreamState = {
   consecutiveWhitespaceCount: number
 }
 
-export const createResponsesStreamState = (): ResponsesStreamState => ({
+export const createResponsesStreamState = (options?: {
+  toolSearchName?: string
+}): ResponsesStreamState => ({
   messageStartSent: false,
   messageCompleted: false,
   nextContentBlockIndex: 0,
   blockIndexByKey: new Map(),
   openBlocks: new Set(),
   blockHasDelta: new Set(),
+  reasoningSummaryHasDelta: new Set(),
   functionCallStateByOutputIndex: new Map(),
+  toolSearchName: options?.toolSearchName ?? BRIDGE_TOOL_SEARCH_NAME,
+  hasToolCall: false,
 })
 
 export const translateResponsesStreamEvent = (
@@ -101,6 +115,10 @@ export const translateResponsesStreamEvent = (
 
     case "response.reasoning_summary_text.delta": {
       return handleReasoningSummaryTextDelta(rawEvent, state)
+    }
+
+    case "response.reasoning_summary_part.added": {
+      return handleReasoningSummaryPartAdded(rawEvent, state)
     }
 
     case "response.output_text.delta": {
@@ -158,7 +176,7 @@ const handleOutputItemAdded = (
   state: ResponsesStreamState,
 ): Array<AnthropicStreamEventData> => {
   const events = new Array<AnthropicStreamEventData>()
-  const functionCallDetails = extractFunctionCallDetails(rawEvent)
+  const functionCallDetails = extractFunctionCallDetails(rawEvent, state)
   if (!functionCallDetails) {
     return events
   }
@@ -196,6 +214,31 @@ const handleOutputItemDone = (
   const itemType = item.type
   const outputIndex = rawEvent.output_index
 
+  if (itemType === "tool_search_call") {
+    const blockIndex = openFunctionCallBlock(state, {
+      outputIndex,
+      toolCallId: item.call_id,
+      name: state.toolSearchName,
+      events,
+    })
+    const finalArguments = stringifyToolSearchArguments(item.arguments)
+
+    if (!state.blockHasDelta.has(blockIndex) && finalArguments) {
+      events.push({
+        type: "content_block_delta",
+        index: blockIndex,
+        delta: {
+          type: "input_json_delta",
+          partial_json: finalArguments,
+        },
+      })
+      state.blockHasDelta.add(blockIndex)
+    }
+
+    state.functionCallStateByOutputIndex.delete(outputIndex)
+    return events
+  }
+
   if (itemType === "compaction") {
     if (!item.id || !item.encrypted_content) {
       return events
@@ -209,7 +252,7 @@ const handleOutputItemDone = (
         index: blockIndex,
         delta: {
           type: "thinking_delta",
-          thinking: THINKING_TEXT,
+          thinking: "",
         },
       })
     }
@@ -236,14 +279,16 @@ const handleOutputItemDone = (
   const blockIndex = openThinkingBlockIfNeeded(state, outputIndex, events)
   const signature = (item.encrypted_content ?? "") + "@" + item.id
   if (signature) {
-    // Compatible with opencode, it will filter out blocks where the thinking text is empty, so we add a default thinking text here
-    if (!item.summary || item.summary.length === 0) {
+    if (
+      (!item.summary || item.summary.length === 0)
+      && !state.blockHasDelta.has(blockIndex)
+    ) {
       events.push({
         type: "content_block_delta",
         index: blockIndex,
         delta: {
           type: "thinking_delta",
-          thinking: THINKING_TEXT,
+          thinking: "",
         },
       })
     }
@@ -388,8 +433,14 @@ const handleReasoningSummaryTextDelta = (
   state: ResponsesStreamState,
 ): Array<AnthropicStreamEventData> => {
   const outputIndex = rawEvent.output_index
+  const summaryIndex = rawEvent.summary_index
   const deltaText = rawEvent.delta
   const events = new Array<AnthropicStreamEventData>()
+
+  if (!deltaText) {
+    return events
+  }
+
   const blockIndex = openThinkingBlockIfNeeded(state, outputIndex, events)
 
   events.push({
@@ -401,7 +452,35 @@ const handleReasoningSummaryTextDelta = (
     },
   })
   state.blockHasDelta.add(blockIndex)
+  state.reasoningSummaryHasDelta.add(getBlockKey(outputIndex, summaryIndex))
 
+  return events
+}
+
+const handleReasoningSummaryPartAdded = (
+  rawEvent: ResponseReasoningSummaryPartAddedEvent,
+  state: ResponsesStreamState,
+): Array<AnthropicStreamEventData> => {
+  const events = new Array<AnthropicStreamEventData>()
+  const blockIndex = openThinkingBlockIfNeeded(
+    state,
+    rawEvent.output_index,
+    events,
+  )
+
+  if (rawEvent.summary_index === 0) {
+    return events
+  }
+
+  events.push({
+    type: "content_block_delta",
+    index: blockIndex,
+    delta: {
+      type: "thinking_delta",
+      thinking: REASONING_SUMMARY_SEPARATOR,
+    },
+  })
+  state.blockHasDelta.add(blockIndex)
   return events
 }
 
@@ -410,11 +489,13 @@ const handleReasoningSummaryTextDone = (
   state: ResponsesStreamState,
 ): Array<AnthropicStreamEventData> => {
   const outputIndex = rawEvent.output_index
+  const summaryIndex = rawEvent.summary_index
   const text = rawEvent.text
   const events = new Array<AnthropicStreamEventData>()
   const blockIndex = openThinkingBlockIfNeeded(state, outputIndex, events)
+  const summaryKey = getBlockKey(outputIndex, summaryIndex)
 
-  if (text && !state.blockHasDelta.has(blockIndex)) {
+  if (text && !state.reasoningSummaryHasDelta.has(summaryKey)) {
     events.push({
       type: "content_block_delta",
       index: blockIndex,
@@ -423,6 +504,7 @@ const handleReasoningSummaryTextDone = (
         thinking: text,
       },
     })
+    state.blockHasDelta.add(blockIndex)
   }
 
   return events
@@ -465,7 +547,10 @@ const handleResponseCompleted = (
   const events = new Array<AnthropicStreamEventData>()
 
   closeAllOpenBlocks(state, events)
-  const anthropic = translateResponsesResultToAnthropic(response)
+  const anthropic = translateResponsesResultToAnthropic(response, {
+    hasToolCall: state.hasToolCall,
+    toolSearchName: state.toolSearchName,
+  })
   events.push(
     {
       type: "message_delta",
@@ -532,8 +617,12 @@ const messageStart = (
 ): Array<AnthropicStreamEventData> => {
   state.messageStartSent = true
   const inputCachedTokens = response.usage?.input_tokens_details?.cached_tokens
+  const cacheWriteTokens =
+    response.usage?.input_tokens_details?.cache_write_tokens
   const inputTokens =
-    (response.usage?.input_tokens ?? 0) - (inputCachedTokens ?? 0)
+    (response.usage?.input_tokens ?? 0)
+    - (inputCachedTokens ?? 0)
+    - (cacheWriteTokens ?? 0)
   return [
     {
       type: "message_start",
@@ -549,6 +638,9 @@ const messageStart = (
           input_tokens: inputTokens,
           output_tokens: 0,
           cache_read_input_tokens: inputCachedTokens ?? 0,
+          ...(cacheWriteTokens !== undefined && {
+            cache_creation_input_tokens: cacheWriteTokens,
+          }),
         },
       },
     },
@@ -651,6 +743,7 @@ const closeAllOpenBlocks = (
   closeOpenBlocks(state, events)
 
   state.functionCallStateByOutputIndex.clear()
+  state.reasoningSummaryHasDelta.clear()
 }
 
 export const buildErrorEvent = (message: string): AnthropicStreamEventData => ({
@@ -674,6 +767,8 @@ const openFunctionCallBlock = (
   },
 ): number => {
   const { outputIndex, toolCallId, name, events } = params
+
+  state.hasToolCall = true
 
   let functionCallState = state.functionCallStateByOutputIndex.get(outputIndex)
 
@@ -723,21 +818,44 @@ type FunctionCallDetails = {
 
 const extractFunctionCallDetails = (
   rawEvent: ResponseOutputItemAddedEvent,
+  state: ResponsesStreamState,
 ): FunctionCallDetails | undefined => {
   const item = rawEvent.item
   const itemType = item.type
+  if (itemType === "tool_search_call") {
+    const outputIndex = rawEvent.output_index
+    const toolCallId = item.call_id
+    const name = state.toolSearchName
+    return {
+      outputIndex,
+      toolCallId,
+      name,
+      initialArguments: "",
+    }
+  }
+
   if (itemType !== "function_call") {
     return undefined
   }
 
   const outputIndex = rawEvent.output_index
   const toolCallId = item.call_id
-  const name = item.name
+  const name = resolveToolUseName(item)
   const initialArguments = item.arguments
   return {
     outputIndex,
     toolCallId,
     name,
     initialArguments,
+  }
+}
+
+const stringifyToolSearchArguments = (
+  argumentsValue: Record<string, unknown> | string,
+): string | undefined => {
+  try {
+    return JSON.stringify(formatToolSearchBridgeArguments(argumentsValue))
+  } catch {
+    return undefined
   }
 }

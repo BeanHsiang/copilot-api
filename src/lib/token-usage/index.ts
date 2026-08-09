@@ -2,6 +2,7 @@ import { requestContext, generateTraceId } from "~/lib/request-context"
 import { state } from "~/lib/state"
 
 import { EventBus } from "../event-bus"
+import { resolveTokenUsageCost, type TokenUsagePricingConfig } from "./pricing"
 import {
   enqueueTokenUsageWrite,
   hasAnyToken,
@@ -16,11 +17,18 @@ import {
 
 export {
   closeUsageStore,
+  getTokenUsageDailySummary,
   getTokenUsageEventsPage,
   getTokenUsageSummary,
+  normalizeOptionalToken,
+  normalizeToken,
 } from "./store"
 
 export type {
+  TokenUsageDailyBucket,
+  TokenUsageDailySummary,
+  TokenUsageCost,
+  TokenUsageEventCost,
   TokenUsageEndpoint,
   TokenUsageEventRecord,
   TokenUsageEventsPage,
@@ -36,6 +44,8 @@ export interface TokenUsageEventInput extends UsageTokens {
   endpoint: TokenUsageEndpoint
   fallbackSessionId?: string | null
   model: string
+  pricing?: TokenUsagePricingConfig | null
+  pricingCurrency?: string | null
   providerName?: string | null
   sessionId?: string | null
   source: TokenUsageSource
@@ -46,6 +56,8 @@ interface TokenUsageRecorderOptions {
   endpoint: TokenUsageEndpoint
   fallbackSessionId?: string | null
   model: string
+  pricing?: TokenUsagePricingConfig | null
+  pricingCurrency?: string | null
   providerName?: string | null
   sessionId?: string | null
   source: TokenUsageSource
@@ -101,11 +113,14 @@ function toPersistedEvent(
   }
 
   const now = new Date()
+  const cost = resolveTokenUsageCost(input)
   return {
     cache_creation_input_tokens: normalizeToken(
       input.cache_creation_input_tokens,
     ),
     cache_read_input_tokens: normalizeToken(input.cache_read_input_tokens),
+    cost_currency: cost?.currency ?? null,
+    cost_source: cost?.source ?? null,
     created_at_ms: now.getTime(),
     created_at_utc: now.toISOString(),
     endpoint: input.endpoint,
@@ -118,6 +133,11 @@ function toPersistedEvent(
       input.fallbackSessionId,
     ),
     source: input.source,
+    total_nano_aiu:
+      input.total_nano_aiu === undefined || input.total_nano_aiu === null ?
+        null
+      : normalizeToken(input.total_nano_aiu),
+    total_cost_nanos: cost?.total_cost_nanos ?? null,
     total_tokens: resolveTotalTokens(input),
     trace_id: resolveTraceId(input.traceId),
     user_id: resolveUserId(input),
@@ -170,6 +190,8 @@ export function normalizeOpenAIUsage(
         completion_tokens?: number
         prompt_tokens?: number
         total_tokens?: number
+        prompt_cache_hit_tokens?: number
+        prompt_cache_miss_tokens?: number
         prompt_tokens_details?: {
           cache_creation_input_tokens?: number
           cached_tokens?: number
@@ -178,16 +200,39 @@ export function normalizeOpenAIUsage(
     | null
     | undefined,
 ): UsageTokens {
-  const cachedTokens = normalizeToken(
-    usage?.prompt_tokens_details?.cached_tokens,
+  if (
+    usage
+    && (Object.hasOwn(usage, "prompt_cache_hit_tokens")
+      || Object.hasOwn(usage, "prompt_cache_miss_tokens"))
+  ) {
+    return {
+      cache_read_input_tokens: normalizeToken(usage.prompt_cache_hit_tokens),
+      input_tokens: normalizeToken(usage.prompt_cache_miss_tokens),
+      output_tokens: normalizeToken(usage.completion_tokens),
+      total_tokens: normalizeOptionalToken(usage.total_tokens),
+    }
+  }
+
+  const promptDetails = usage?.prompt_tokens_details
+  const hasCacheCreationTokens = Boolean(
+    promptDetails
+      && Object.hasOwn(promptDetails, "cache_creation_input_tokens"),
   )
+  const hasCachedTokens = Boolean(
+    promptDetails && Object.hasOwn(promptDetails, "cached_tokens"),
+  )
+  const cachedTokens = normalizeToken(promptDetails?.cached_tokens)
   const cacheCreationTokens = normalizeToken(
-    usage?.prompt_tokens_details?.cache_creation_input_tokens,
+    promptDetails?.cache_creation_input_tokens,
   )
   const promptTokens = normalizeToken(usage?.prompt_tokens)
   return {
-    cache_creation_input_tokens: cacheCreationTokens,
-    cache_read_input_tokens: cachedTokens,
+    ...(hasCacheCreationTokens && {
+      cache_creation_input_tokens: cacheCreationTokens,
+    }),
+    ...(hasCachedTokens && {
+      cache_read_input_tokens: cachedTokens,
+    }),
     input_tokens: Math.max(
       0,
       promptTokens - cachedTokens - cacheCreationTokens,
@@ -203,6 +248,7 @@ export function normalizeResponsesUsage(
         input_tokens?: number
         input_tokens_details?: {
           cached_tokens?: number
+          cache_write_tokens?: number
         }
         output_tokens?: number
         total_tokens?: number
@@ -213,10 +259,16 @@ export function normalizeResponsesUsage(
   const cachedTokens = normalizeToken(
     usage?.input_tokens_details?.cached_tokens,
   )
+  const cacheWriteTokens = normalizeToken(
+    usage?.input_tokens_details?.cache_write_tokens,
+  )
   const inputTokens = normalizeToken(usage?.input_tokens)
   return {
+    ...(cacheWriteTokens > 0 && {
+      cache_creation_input_tokens: cacheWriteTokens,
+    }),
     cache_read_input_tokens: cachedTokens,
-    input_tokens: Math.max(0, inputTokens - cachedTokens),
+    input_tokens: Math.max(0, inputTokens - cachedTokens - cacheWriteTokens),
     output_tokens: normalizeToken(usage?.output_tokens),
     total_tokens: normalizeOptionalToken(usage?.total_tokens),
   }
@@ -227,6 +279,7 @@ export function normalizeAnthropicUsage(
     | {
         cache_creation_input_tokens?: number
         cache_read_input_tokens?: number
+        cost?: number
         input_tokens?: number
         output_tokens?: number
         total_tokens?: number
@@ -241,6 +294,7 @@ export function normalizeAnthropicUsage(
     cache_read_input_tokens: normalizeOptionalToken(
       usage?.cache_read_input_tokens,
     ),
+    cost: normalizeOptionalCost(usage?.cost),
     input_tokens: normalizeOptionalToken(usage?.input_tokens),
     output_tokens: normalizeOptionalToken(usage?.output_tokens),
     total_tokens: normalizeOptionalToken(usage?.total_tokens),
@@ -256,8 +310,18 @@ export function mergeAnthropicUsage(
       next.cache_creation_input_tokens ?? current.cache_creation_input_tokens,
     cache_read_input_tokens:
       next.cache_read_input_tokens ?? current.cache_read_input_tokens,
+    cost: next.cost ?? current.cost,
     input_tokens: next.input_tokens ?? current.input_tokens,
     output_tokens: next.output_tokens ?? current.output_tokens,
+    total_nano_aiu: next.total_nano_aiu ?? current.total_nano_aiu,
     total_tokens: next.total_tokens ?? current.total_tokens,
   }
+}
+
+function normalizeOptionalCost(
+  value: number | null | undefined,
+): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ?
+      value
+    : undefined
 }

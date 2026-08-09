@@ -1,9 +1,23 @@
 import consola from "consola"
 
 import {
+  BRIDGE_TOOL_SEARCH_NAME,
+  formatToolSearchBridgeArguments,
+  isBridgeToolSearchName,
+  isDeferredToolName,
+  listDeferredToolNames,
+  normalizeToolSearchBridgeArguments,
+  parseMcpToolSearchSentinel,
+  selectDeferredToolsByNames,
+  shouldEnableResponsesToolSearch,
+} from "~/lib/tool-search"
+import { HTTPError } from "~/lib/error"
+import {
   getExtraPromptForModel,
   getReasoningEffortForModel,
+  isGpt56OrAbove,
 } from "~/lib/config"
+import { requestContext } from "~/lib/request-context"
 import { parseUserIdMetadata } from "~/lib/utils"
 import {
   type ResponsesPayload,
@@ -19,6 +33,7 @@ import {
   type ResponseOutputContentBlock,
   type ResponseOutputCompaction,
   type ResponseOutputFunctionCall,
+  type ResponseOutputToolSearchCall,
   type ResponseOutputItem,
   type ResponseOutputReasoning,
   type ResponseReasoningBlock,
@@ -26,10 +41,12 @@ import {
   type ResponseOutputText,
   type ResponseFunctionToolCallItem,
   type ResponseFunctionCallOutputItem,
+  type ResponseToolSearchCallItem,
+  type ResponseToolSearchOutputItem,
   type Tool,
   type ToolChoiceFunction,
   type ToolChoiceOptions,
-} from "~/services/copilot/create-responses"
+} from "~/lib/types/responses"
 
 import {
   type AnthropicAssistantContentBlock,
@@ -47,31 +64,80 @@ import {
   type AnthropicToolUseBlock,
   type AnthropicUserContentBlock,
   type AnthropicUserMessage,
-} from "./anthropic-types"
-import { normalizeToolSchema } from "./non-stream-translation"
+} from "~/lib/types/anthropic"
+import { normalizeToolSchema, THINKING_TEXT } from "./non-stream-translation"
 
 const MESSAGE_TYPE = "message"
 const COMPACTION_SIGNATURE_PREFIX = "cm1#"
 const COMPACTION_SIGNATURE_SEPARATOR = "@"
 
-export const THINKING_TEXT = "Thinking..."
+export { THINKING_TEXT }
+export const REASONING_SUMMARY_SEPARATOR = "\u00A0\n\n"
+const REASONING_SUMMARY_SEPARATOR_PATTERN = /\u00a0\n\n|\u2063\n\n/
+
+const resolveReasoningEffort = (payload: AnthropicMessagesPayload) =>
+  payload.output_config?.effort ?? getReasoningEffortForModel(payload.model)
+
+const buildPromptCacheKey = (
+  basePromptCacheKey: string | null,
+  subagentAgentId?: string | null,
+): string | null => {
+  if (!basePromptCacheKey) {
+    return null
+  }
+
+  const normalizedSubagentAgentId = subagentAgentId?.trim() || null
+  if (!normalizedSubagentAgentId) {
+    return basePromptCacheKey
+  }
+
+  return `${basePromptCacheKey}:agent:${normalizedSubagentAgentId}`
+}
 
 export const translateAnthropicMessagesToResponsesPayload = (
   payload: AnthropicMessagesPayload,
+  subagentAgentId?: string | null,
 ): ResponsesPayload => {
   const input: Array<ResponseInputItem> = []
   const applyPhase = shouldApplyPhase(payload.model)
-
-  for (const message of payload.messages) {
-    input.push(...translateMessage(message, payload.model, applyPhase))
+  const toolSearchEnabled = shouldEnableResponsesToolSearch({
+    model: payload.model,
+    tools: payload.tools,
+  })
+  const translationState: TranslationState = {
+    originalTools: payload.tools ?? [],
+    toolSearchEnabled,
+    toolUseNameById: new Map(),
   }
 
-  const translatedTools = convertAnthropicTools(payload.tools)
-  const toolChoice = convertAnthropicToolChoice(payload.tool_choice)
+  for (const message of payload.messages as Array<AnthropicMessage>) {
+    input.push(
+      ...translateMessage(message, payload.model, applyPhase, translationState),
+    )
+  }
+
+  const hasOriginalTools =
+    Array.isArray(payload.tools) && payload.tools.length > 0
+  const translatedTools = convertAnthropicTools(
+    payload.tools,
+    toolSearchEnabled,
+  )
+  const toolChoice = convertAnthropicToolChoice(
+    payload.tool_choice,
+    toolSearchEnabled,
+  )
 
   // Remove safetyIdentifier to align with vscode copilot
-  const { sessionId: promptCacheKey } = parseUserIdMetadata(
+  const { sessionId: metadataPromptCacheKey } = parseUserIdMetadata(
     payload.metadata?.user_id,
+  )
+
+  const requestStore = requestContext.getStore()
+  const sessionAffinity = requestStore?.sessionAffinity?.trim() || null
+  const basePromptCacheKey = metadataPromptCacheKey ?? sessionAffinity
+  const promptCacheKey = buildPromptCacheKey(
+    basePromptCacheKey,
+    subagentAgentId,
   )
 
   const responsesPayload: ResponsesPayload = {
@@ -84,19 +150,29 @@ export const translateAnthropicMessagesToResponsesPayload = (
     tools: translatedTools,
     tool_choice: toolChoice,
     metadata: payload.metadata ? { ...payload.metadata } : null,
-    prompt_cache_key: promptCacheKey,
     //prompt_cache_retention: "24h",  not work in gpt-5.4
     stream: payload.stream ?? null,
     store: false,
     parallel_tool_calls: true,
     reasoning: {
-      effort: getReasoningEffortForModel(payload.model),
-      summary: "detailed",
+      effort: resolveReasoningEffort(payload),
+      summary: "auto",
+      context: isSupportAllTurns(payload) ? "all_turns" : "auto",
     },
     include: ["reasoning.encrypted_content"],
   }
 
+  if (hasOriginalTools) {
+    responsesPayload.prompt_cache_key = promptCacheKey
+  }
+
   return responsesPayload
+}
+
+interface TranslationState {
+  originalTools: Array<AnthropicTool>
+  toolSearchEnabled: boolean
+  toolUseNameById: Map<string, string>
 }
 
 type CompactionCarrier = {
@@ -141,16 +217,18 @@ const translateMessage = (
   message: AnthropicMessage,
   model: string,
   applyPhase: boolean,
+  state: TranslationState,
 ): Array<ResponseInputItem> => {
   if (message.role === "user") {
-    return translateUserMessage(message)
+    return translateUserMessage(message, state)
   }
 
-  return translateAssistantMessage(message, model, applyPhase)
+  return translateAssistantMessage(message, model, applyPhase, state)
 }
 
 const translateUserMessage = (
   message: AnthropicUserMessage,
+  state: TranslationState,
 ): Array<ResponseInputItem> => {
   if (typeof message.content === "string") {
     return [createMessage("user", message.content)]
@@ -166,7 +244,7 @@ const translateUserMessage = (
   for (const block of message.content) {
     if (block.type === "tool_result") {
       flushPendingContent(pendingContent, items, { role: "user" })
-      items.push(createFunctionCallOutput(block))
+      items.push(createToolCallOutput(block, state))
       continue
     }
 
@@ -185,6 +263,7 @@ const translateAssistantMessage = (
   message: AnthropicAssistantMessage,
   model: string,
   applyPhase: boolean,
+  state: TranslationState,
 ): Array<ResponseInputItem> => {
   const assistantPhase = resolveAssistantPhase(
     model,
@@ -205,11 +284,12 @@ const translateAssistantMessage = (
 
   for (const block of message.content) {
     if (block.type === "tool_use") {
+      state.toolUseNameById.set(block.id, block.name)
       flushPendingContent(pendingContent, items, {
         role: "assistant",
         phase: assistantPhase,
       })
-      items.push(createFunctionToolCall(block))
+      items.push(createToolCall(block, state))
       continue
     }
 
@@ -332,9 +412,8 @@ const resolveAssistantPhase = (
   return hasToolUse ? "commentary" : "final_answer"
 }
 
-const shouldApplyPhase = (model: string): boolean => {
-  const extraPrompt = getExtraPromptForModel(model)
-  return extraPrompt.includes("## Intermediary updates")
+const shouldApplyPhase = (_model: string): boolean => {
+  return true
 }
 
 const createTextContent = (text: string): ResponseInputText => ({
@@ -366,17 +445,34 @@ const createFileContent = (
 const createReasoningContent = (
   block: AnthropicThinkingBlock,
 ): ResponseInputReasoning => {
-  // align with vscode-copilot-chat extractThinkingData, should add id, otherwise it will cause miss cache occasionally —— the usage input cached tokens to be 0
-  // https://github.com/microsoft/vscode-copilot-chat/blob/main/src/platform/endpoint/node/responsesApi.ts#L162
-  // when use in codex cli, reasoning id is empty, so it will cause miss cache occasionally
+  // align with vscode-copilot-chat extractThinkingData, should add id
+  // https://github.com/microsoft/vscode/blob/1.128.0/extensions/copilot/src/platform/endpoint/node/responsesApi.ts#L651
   const { encryptedContent, id } = parseReasoningSignature(block.signature)
   const thinking = block.thinking === THINKING_TEXT ? "" : block.thinking
+
   return {
     id,
     type: "reasoning",
-    summary: thinking ? [{ type: "summary_text", text: thinking }] : [],
+    summary: createReasoningSummary(thinking),
     encrypted_content: encryptedContent,
   }
+}
+
+const createReasoningSummary = (
+  thinking: string,
+): ResponseInputReasoning["summary"] => {
+  if (thinking.length === 0) {
+    return []
+  }
+
+  if (!REASONING_SUMMARY_SEPARATOR_PATTERN.test(thinking)) {
+    return [{ type: "summary_text", text: thinking }]
+  }
+
+  return thinking.split(REASONING_SUMMARY_SEPARATOR_PATTERN).map((text) => ({
+    type: "summary_text",
+    text,
+  }))
 }
 
 const createCompactionContent = (
@@ -411,13 +507,38 @@ const parseReasoningSignature = (
 
 const createFunctionToolCall = (
   block: AnthropicToolUseBlock,
+  state: TranslationState,
 ): ResponseFunctionToolCallItem => ({
   type: "function_call",
   call_id: block.id,
   name: block.name,
   arguments: JSON.stringify(block.input),
   status: "completed",
+  ...(state.toolSearchEnabled && isDeferredToolName(block.name) ?
+    { namespace: block.name }
+  : {}),
 })
+
+const createToolSearchCall = (
+  block: AnthropicToolUseBlock,
+): ResponseToolSearchCallItem => ({
+  type: "tool_search_call",
+  call_id: block.id,
+  arguments: normalizeToolSearchBridgeArguments(block.input),
+  execution: "client",
+  status: "completed",
+})
+
+const createToolCall = (
+  block: AnthropicToolUseBlock,
+  state: TranslationState,
+): ResponseFunctionToolCallItem | ResponseToolSearchCallItem => {
+  if (state.toolSearchEnabled && isBridgeToolSearchName(block.name)) {
+    return createToolSearchCall(block)
+  }
+
+  return createFunctionToolCall(block, state)
+}
 
 const createFunctionCallOutput = (
   block: AnthropicToolResultBlock,
@@ -427,6 +548,127 @@ const createFunctionCallOutput = (
   output: convertToolResultContent(block.content),
   status: block.is_error ? "incomplete" : "completed",
 })
+
+const createToolCallOutput = (
+  block: AnthropicToolResultBlock,
+  state: TranslationState,
+): ResponseFunctionCallOutputItem | ResponseToolSearchOutputItem => {
+  const toolUseName = state.toolUseNameById.get(block.tool_use_id)
+  if (state.toolSearchEnabled && isBridgeToolSearchName(toolUseName ?? "")) {
+    return createToolSearchOutput(block, state.originalTools)
+  }
+
+  return createFunctionCallOutput(block)
+}
+
+const createToolSearchOutput = (
+  block: AnthropicToolResultBlock,
+  originalTools: Array<AnthropicTool>,
+): ResponseToolSearchOutputItem => {
+  const referencedToolNames = resolveToolSearchReferencedToolNames(
+    block.content,
+    originalTools,
+  )
+
+  return {
+    type: "tool_search_output",
+    call_id: block.tool_use_id,
+    tools: referencedToolNames.map((toolName) =>
+      convertDeferredToolToNamespace(
+        resolveDeferredTool(toolName, originalTools),
+      ),
+    ),
+    execution: "client",
+    status: block.is_error ? "incomplete" : "completed",
+  }
+}
+
+const resolveToolSearchReferencedToolNames = (
+  content: string | Array<AnthropicToolResultContentBlock>,
+  originalTools: Array<AnthropicTool>,
+): Array<string> => {
+  const explicitReferences = extractToolReferenceNames(content)
+  if (explicitReferences.length > 0) {
+    return uniqueToolNames(explicitReferences)
+  }
+
+  const sentinel = extractMcpToolSearchSentinel(content)
+  if (sentinel) {
+    return selectDeferredToolsByNames(sentinel.names, originalTools).map(
+      (tool) => tool.name,
+    )
+  }
+
+  return []
+}
+
+const extractToolReferenceNames = (
+  content: string | Array<AnthropicToolResultContentBlock>,
+): Array<string> => {
+  if (!Array.isArray(content)) {
+    return []
+  }
+
+  return content.flatMap((block) =>
+    block.type === "tool_reference" ? [block.tool_name] : [],
+  )
+}
+
+const extractMcpToolSearchSentinel = (
+  content: string | Array<AnthropicToolResultContentBlock>,
+) => {
+  if (typeof content === "string") {
+    return parseMcpToolSearchSentinel(content)
+  }
+
+  for (const block of content) {
+    if (block.type !== "text") {
+      continue
+    }
+
+    const sentinel = parseMcpToolSearchSentinel(block.text)
+    if (sentinel) {
+      return sentinel
+    }
+  }
+
+  return null
+}
+
+const resolveDeferredTool = (
+  toolName: string,
+  originalTools: Array<AnthropicTool>,
+): AnthropicTool => {
+  const tool = originalTools.find((candidate) => candidate.name === toolName)
+  if (tool && isDeferredToolName(tool.name)) {
+    return tool
+  }
+
+  throw createInvalidRequestError(
+    `Tool reference '${toolName}' has no corresponding deferred tool definition`,
+  )
+}
+
+const uniqueToolNames = (toolNames: Array<string>): Array<string> => [
+  ...new Set(toolNames),
+]
+
+const createInvalidRequestError = (message: string): HTTPError =>
+  new HTTPError(
+    message,
+    new Response(
+      JSON.stringify({
+        error: {
+          message,
+          type: "invalid_request_error",
+        },
+      }),
+      {
+        status: 400,
+        headers: { "content-type": "application/json" },
+      },
+    ),
+  )
 
 const translateSystemPrompt = (
   system: string | Array<AnthropicTextBlock> | undefined,
@@ -455,22 +697,89 @@ const translateSystemPrompt = (
 
 const convertAnthropicTools = (
   tools: Array<AnthropicTool> | undefined,
+  toolSearchEnabled: boolean,
 ): Array<Tool> | null => {
   if (!tools || tools.length === 0) {
     return null
   }
 
-  return tools.map((tool) => ({
-    type: "function",
-    name: tool.name,
-    parameters: normalizeToolSchema(tool.input_schema),
-    strict: false,
-    ...(tool.description ? { description: tool.description } : {}),
-  }))
+  const converted: Array<Tool> = []
+  let addedToolSearch = false
+  const searchableToolNames =
+    toolSearchEnabled ? listDeferredToolNames(tools) : []
+
+  for (const tool of tools) {
+    if (isBridgeToolSearchName(tool.name)) {
+      if (toolSearchEnabled && !addedToolSearch) {
+        converted.push(createResponsesToolSearchDefinition(searchableToolNames))
+        addedToolSearch = true
+      }
+      continue
+    }
+
+    if (toolSearchEnabled && isDeferredToolName(tool.name)) {
+      converted.push(convertDeferredToolToNamespace(tool))
+      continue
+    }
+
+    converted.push(convertToolToFunction(tool))
+  }
+
+  return converted
 }
+
+const createResponsesToolSearchDefinition = (
+  searchableToolNames: Array<string>,
+): Tool => ({
+  type: "tool_search",
+  execution: "client",
+  description:
+    "Load deferred tools by exact name before using them. Return only the searchable tool names you need for the next step.",
+  parameters: {
+    type: "object",
+    properties: {
+      names: {
+        type: "array",
+        description: "Exact deferred tool names to load.",
+        items: {
+          type: "string",
+          enum: searchableToolNames,
+        },
+        minItems: 1,
+      },
+    },
+    required: ["names"],
+    additionalProperties: false,
+  },
+})
+
+const convertToolToFunction = (tool: AnthropicTool): Tool => ({
+  type: "function",
+  name: tool.name,
+  parameters: normalizeToolSchema(tool.input_schema),
+  strict: false,
+  ...(tool.description ? { description: tool.description } : {}),
+})
+
+const convertDeferredToolToNamespace = (tool: AnthropicTool): Tool => ({
+  type: "namespace",
+  name: tool.name,
+  ...(tool.description ? { description: tool.description } : {}),
+  tools: [
+    {
+      type: "function",
+      name: tool.name,
+      parameters: normalizeToolSchema(tool.input_schema),
+      strict: false,
+      defer_loading: true,
+      ...(tool.description ? { description: tool.description } : {}),
+    },
+  ],
+})
 
 const convertAnthropicToolChoice = (
   choice: AnthropicMessagesPayload["tool_choice"],
+  toolSearchEnabled: boolean,
 ): ToolChoiceOptions | ToolChoiceFunction => {
   if (!choice) {
     return "auto"
@@ -484,6 +793,13 @@ const convertAnthropicToolChoice = (
       return "required"
     }
     case "tool": {
+      if (
+        toolSearchEnabled
+        && choice.name
+        && isBridgeToolSearchName(choice.name)
+      ) {
+        return "auto"
+      }
       return choice.name ? { type: "function", name: choice.name } : "auto"
     }
     case "none": {
@@ -495,17 +811,23 @@ const convertAnthropicToolChoice = (
   }
 }
 
+interface ResponsesToAnthropicOptions {
+  toolSearchName?: string
+  hasToolCall?: boolean
+}
+
 export const translateResponsesResultToAnthropic = (
   response: ResponsesResult,
+  options?: ResponsesToAnthropicOptions,
 ): AnthropicResponse => {
-  const contentBlocks = mapOutputToAnthropicContent(response.output)
+  const contentBlocks = mapOutputToAnthropicContent(response.output, options)
   const usage = mapResponsesUsage(response)
   let anthropicContent = fallbackContentBlocks(response.output_text)
   if (contentBlocks.length > 0) {
     anthropicContent = contentBlocks
   }
 
-  const stopReason = mapResponsesStopReason(response)
+  const stopReason = mapResponsesStopReason(response, options)
 
   return {
     id: response.id,
@@ -521,14 +843,17 @@ export const translateResponsesResultToAnthropic = (
 
 const mapOutputToAnthropicContent = (
   output: Array<ResponseOutputItem>,
+  options?: ResponsesToAnthropicOptions,
 ): Array<AnthropicAssistantContentBlock> => {
   const contentBlocks: Array<AnthropicAssistantContentBlock> = []
-
+  if (!output) {
+    output = []
+  }
   for (const item of output) {
     switch (item.type) {
       case "reasoning": {
         const thinkingText = extractReasoningText(item)
-        if (thinkingText.length > 0) {
+        if (thinkingText.length > 0 || (item.id && item.encrypted_content)) {
           contentBlocks.push({
             type: "thinking",
             thinking: thinkingText,
@@ -542,6 +867,19 @@ const mapOutputToAnthropicContent = (
         if (toolUseBlock) {
           contentBlocks.push(toolUseBlock)
         }
+        break
+      }
+      case "tool_search_call": {
+        const toolUseBlock = createToolSearchUseContentBlock(
+          item,
+          options?.toolSearchName,
+        )
+        if (toolUseBlock) {
+          contentBlocks.push(toolUseBlock)
+        }
+        break
+      }
+      case "tool_search_output": {
         break
       }
       case "message": {
@@ -623,21 +961,17 @@ const extractReasoningText = (item: ResponseOutputReasoning): string => {
     }
   }
 
-  // Compatible with opencode, it will filter out blocks where the thinking text is empty, so we add a default thinking text here
-  if (!item.summary || item.summary.length === 0) {
-    return THINKING_TEXT
-  }
-
   collectFromBlocks(item.summary)
 
-  return segments.join("").trim()
+  return segments.join(REASONING_SUMMARY_SEPARATOR).trim()
 }
 
 const createToolUseContentBlock = (
   call: ResponseOutputFunctionCall,
 ): AnthropicToolUseBlock | null => {
   const toolId = call.call_id
-  if (!call.name || !toolId) {
+  const toolName = resolveToolUseName(call)
+  if (!toolName || !toolId) {
     return null
   }
 
@@ -646,9 +980,36 @@ const createToolUseContentBlock = (
   return {
     type: "tool_use",
     id: toolId,
-    name: call.name,
+    name: toolName,
     input,
   }
+}
+
+const createToolSearchUseContentBlock = (
+  call: ResponseOutputToolSearchCall,
+  toolSearchName = BRIDGE_TOOL_SEARCH_NAME,
+): AnthropicToolUseBlock | null => {
+  const toolId = call.call_id
+  if (!toolId) {
+    return null
+  }
+
+  return {
+    type: "tool_use",
+    id: toolId,
+    name: toolSearchName,
+    input: parseToolSearchArguments(call.arguments),
+  }
+}
+
+export const resolveToolUseName = (
+  call: Pick<ResponseOutputFunctionCall, "name" | "namespace">,
+): string => {
+  if (typeof call.namespace === "string" && call.namespace.length > 0) {
+    return call.namespace
+  }
+
+  return call.name
 }
 
 const createCompactionThinkingBlock = (
@@ -695,6 +1056,12 @@ const parseFunctionCallArguments = (
   return { raw_arguments: rawArguments }
 }
 
+const parseToolSearchArguments = (
+  argumentsValue: Record<string, unknown> | string,
+): Record<string, unknown> => {
+  return formatToolSearchBridgeArguments(argumentsValue)
+}
+
 const fallbackContentBlocks = (
   outputText: string,
 ): Array<AnthropicAssistantContentBlock> => {
@@ -712,11 +1079,21 @@ const fallbackContentBlocks = (
 
 const mapResponsesStopReason = (
   response: ResponsesResult,
+  options?: ResponsesToAnthropicOptions,
 ): AnthropicResponse["stop_reason"] => {
   const { status, incomplete_details: incompleteDetails } = response
 
   if (status === "completed") {
-    if (response.output.some((item) => item.type === "function_call")) {
+    if (!response.output || response.output.length === 0) {
+      return options?.hasToolCall ? "tool_use" : "end_turn"
+    }
+
+    if (
+      response.output.some(
+        (item) =>
+          item.type === "function_call" || item.type === "tool_search_call",
+      )
+    ) {
       return "tool_use"
     }
     return "end_turn"
@@ -740,13 +1117,18 @@ const mapResponsesUsage = (
   const inputTokens = response.usage?.input_tokens ?? 0
   const outputTokens = response.usage?.output_tokens ?? 0
   const inputCachedTokens = response.usage?.input_tokens_details?.cached_tokens
+  const cacheWriteTokens =
+    response.usage?.input_tokens_details?.cache_write_tokens
 
   return {
-    input_tokens: inputTokens - (inputCachedTokens ?? 0),
+    input_tokens:
+      inputTokens - (inputCachedTokens ?? 0) - (cacheWriteTokens ?? 0),
     output_tokens: outputTokens,
-    ...(response.usage?.input_tokens_details?.cached_tokens !== undefined && {
-      cache_read_input_tokens:
-        response.usage.input_tokens_details.cached_tokens,
+    ...(inputCachedTokens !== undefined && {
+      cache_read_input_tokens: inputCachedTokens,
+    }),
+    ...(cacheWriteTokens !== undefined && {
+      cache_creation_input_tokens: cacheWriteTokens,
     }),
   }
 }
@@ -804,4 +1186,15 @@ const convertToolResultContent = (
   }
 
   return ""
+}
+
+const isSupportAllTurns = (payload: AnthropicMessagesPayload): boolean => {
+  if (
+    payload.model === "gpt-5.4"
+    || payload.model === "gpt-5.4-mini"
+    || payload.model === "gpt-5.5"
+  ) {
+    return true
+  }
+  return isGpt56OrAbove(payload.model)
 }

@@ -4,8 +4,10 @@ import net from 'node:net'
 import path from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 
-import type { ServerStatus } from '../src/types/ipc'
+import type { DesktopProxySettings, ServerStatus } from '../src/types/ipc'
+import { applyDesktopProxySettingsToEnv } from './electron-proxy-config'
 import { tMain } from './i18n'
+import { buildServerStartArgs } from './server-start-args'
 
 let serverProcess: UtilityProcess | null = null
 let currentPort = 4141
@@ -13,6 +15,7 @@ let statusCallback: ((status: ServerStatus) => void) | null = null
 let logCallback: ((log: string) => void) | null = null
 // Ring buffer for logs, capped at 2000 entries for log panel replay.
 const LOG_BUFFER_MAX = 2000
+const STOP_TIMEOUT_MS = 5000
 const logBuffer: string[] = []
 const ESC_CHAR_CODE = 27
 const BEL_CHAR_CODE = 7
@@ -35,7 +38,10 @@ function skipCsiSequence(input: string, startIndex: number): number {
   return inputLength
 }
 
-function skipStringTerminatedSequence(input: string, startIndex: number): number {
+function skipStringTerminatedSequence(
+  input: string,
+  startIndex: number,
+): number {
   const inputLength = input.length
   let index = startIndex
 
@@ -83,7 +89,13 @@ function stripAnsi(input: string): string {
       continue
     }
 
-    if (next === ']' || next === 'P' || next === 'X' || next === '^' || next === '_') {
+    if (
+      next === ']'
+      || next === 'P'
+      || next === 'X'
+      || next === '^'
+      || next === '_'
+    ) {
       index = skipStringTerminatedSequence(input, index + 2)
       lastIndex = index
       continue
@@ -112,14 +124,14 @@ function createLogStream() {
   let flushed = false
 
   return {
-    handleData(data: Buffer) {
+    handleData: (data: Buffer) => {
       emitLog(decoder.write(data))
     },
-    flush() {
+    flush: () => {
       if (flushed) return
       flushed = true
       emitLog(decoder.end())
-    }
+    },
   }
 }
 
@@ -154,14 +166,18 @@ function getServerPath(): string {
 
 export async function startServer(
   port: number,
-  token: string,
-  serverOptions?: { accountType?: string; verbose?: boolean; showToken?: boolean }
+  token: string | null,
+  serverOptions?: {
+    verbose?: boolean
+    showToken?: boolean
+    proxy?: DesktopProxySettings
+  },
 ): Promise<ServerStatus> {
   const available = await checkPortAvailable(port)
   if (!available) {
     return {
       running: false,
-      error: await tMain('server.portInUse', { port })
+      error: await tMain('server.portInUse', { port }),
     }
   }
 
@@ -176,53 +192,59 @@ export async function startServer(
 
   const env: NodeJS.ProcessEnv = {
     ...process.env,
-    NODE_ENV: 'production'
+    NODE_ENV: 'production',
   }
+  const proxyEnabled =
+    serverOptions?.proxy ?
+      applyDesktopProxySettingsToEnv(env, serverOptions.proxy)
+    : false
 
   const serverPath = getServerPath()
-  const args = ['start', '--github-token', token, '--port', String(port)]
-  if (serverOptions?.accountType && serverOptions.accountType !== 'individual') {
-    args.push('--account-type', serverOptions.accountType)
-  }
+  const args = buildServerStartArgs(port, token)
+  if (proxyEnabled) args.push('--proxy-env')
   if (serverOptions?.verbose) args.push('--verbose')
   if (serverOptions?.showToken) args.push('--show-token')
 
   // utilityProcess.fork is an official Electron API and does not start another
   // Electron instance, so packaged macOS builds do not show a second Dock icon.
-  serverProcess = utilityProcess.fork(serverPath, args, {
+  const proc = utilityProcess.fork(serverPath, args, {
     env,
     stdio: 'pipe',
-    serviceName: 'copilot-api-server'
+    serviceName: 'copilot-api-server',
   })
+  serverProcess = proc
 
   // Decode streamed UTF-8 safely so chunk boundaries do not corrupt Chinese or box-drawing characters.
   const stdoutLogStream = createLogStream()
   const stderrLogStream = createLogStream()
 
-  serverProcess.stdout?.on('data', stdoutLogStream.handleData)
-  serverProcess.stdout?.once('end', stdoutLogStream.flush)
-  serverProcess.stdout?.once('close', stdoutLogStream.flush)
-  serverProcess.stderr?.on('data', stderrLogStream.handleData)
-  serverProcess.stderr?.once('end', stderrLogStream.flush)
-  serverProcess.stderr?.once('close', stderrLogStream.flush)
+  proc.stdout?.on('data', stdoutLogStream.handleData)
+  proc.stdout?.once('end', stdoutLogStream.flush)
+  proc.stdout?.once('close', stdoutLogStream.flush)
+  proc.stderr?.on('data', stderrLogStream.handleData)
+  proc.stderr?.once('end', stderrLogStream.flush)
+  proc.stderr?.once('close', stderrLogStream.flush)
 
   // Wait for the server to become ready while also detecting early process exit.
-  const startResult = await waitForServer(port, serverProcess)
+  const startResult = await waitForServer(port, proc)
   if (!startResult.ok) {
-    if (serverProcess) {
-      serverProcess.kill()
+    proc.kill()
+    if (serverProcess === proc) {
       serverProcess = null
     }
-    const msg = startResult.exitCode !== undefined
-      ? await tMain('server.startFailed', { code: startResult.exitCode })
+    const msg =
+      startResult.exitCode !== undefined ?
+        await tMain('server.startFailed', { code: startResult.exitCode })
       : await tMain('server.startTimeout', { port })
     return { running: false, error: msg }
   }
 
   // Register the runtime exit handler only after startup succeeds.
-  serverProcess!.on('exit', (code) => {
+  proc.on('exit', (code) => {
     stdoutLogStream.flush()
     stderrLogStream.flush()
+    if (serverProcess !== proc) return
+
     serverProcess = null
 
     if (code === 0) {
@@ -230,12 +252,14 @@ export async function startServer(
       return
     }
 
-    void tMain('server.processExit', { code: String(code ?? 'unknown') }).then((error) => {
-      statusCallback?.({
-        running: false,
-        error
-      })
-    })
+    void tMain('server.processExit', { code: String(code ?? 'unknown') }).then(
+      (error) => {
+        statusCallback?.({
+          running: false,
+          error,
+        })
+      },
+    )
   })
 
   return { running: true, port }
@@ -244,7 +268,7 @@ export async function startServer(
 // Wait for server readiness or process exit, whichever happens first.
 async function waitForServer(
   port: number,
-  proc: UtilityProcess
+  proc: UtilityProcess,
 ): Promise<{ ok: boolean; exitCode?: number }> {
   return new Promise((resolve) => {
     let settled = false
@@ -282,10 +306,35 @@ async function waitForServer(
   })
 }
 
+function waitForProcessExit(proc: UtilityProcess): Promise<void> {
+  return new Promise((resolve) => {
+    let settled = false
+
+    const finish = () => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeout)
+      proc.removeListener('exit', onExit)
+      resolve()
+    }
+
+    const onExit = () => finish()
+    const timeout = setTimeout(finish, STOP_TIMEOUT_MS)
+
+    proc.once('exit', onExit)
+    if (!proc.kill()) finish()
+  })
+}
+
 export async function stopServer(): Promise<void> {
   if (!serverProcess) return
-  serverProcess.kill()
-  serverProcess = null
+  const proc = serverProcess
+  await waitForProcessExit(proc)
+
+  if (serverProcess === proc) {
+    serverProcess = null
+    statusCallback?.({ running: false })
+  }
 }
 
 export function isRunning(): boolean {

@@ -1,16 +1,35 @@
-import { beforeEach, expect, mock, test } from "bun:test"
+import { afterEach, beforeEach, expect, mock, test } from "bun:test"
+import { Hono } from "hono"
 
-import type { AnthropicMessagesPayload } from "../src/routes/messages/anthropic-types"
+import type {
+  AnthropicMessagesPayload,
+  AnthropicResponse,
+} from "~/lib/types/anthropic"
+import type { Model } from "~/lib/types/models"
 import type {
   ChatCompletionResponse,
   ChatCompletionsPayload,
-} from "../src/services/copilot/create-chat-completions"
+} from "~/lib/types/chat-completions"
+import type { CreateMessagesReturn } from "~/services/copilot/create-messages"
+import type {
+  CreateResponsesReturn,
+  ResponsesPayload,
+  ResponsesResult,
+  ResponsesTransport,
+} from "~/lib/types/responses"
 
-const actualChatCompletionsModule = await import(
-  "../src/services/copilot/create-chat-completions"
-)
+import { COMPACT_REQUEST } from "~/lib/compact"
+import { closeUsageStore, getTokenUsageEventsPage } from "~/lib/token-usage"
+
+const DB_PATH_ENV = "COPILOT_API_SQLITE_DB_PATH"
 
 let capturedPayload: ChatCompletionsPayload | null = null
+let capturedMessagesPayload: AnthropicMessagesPayload | null = null
+let capturedResponsesPayload: ResponsesPayload | null = null
+let capturedResponsesOptions: {
+  transport?: ResponsesTransport
+} | null = null
+let responsesApiWebSocketEnabled = true
 
 const createChatCompletions = mock(
   (payload: ChatCompletionsPayload): Promise<ChatCompletionResponse> => {
@@ -34,14 +53,36 @@ const createChatCompletions = mock(
     })
   },
 )
+const createMessages = mock(
+  (payload: AnthropicMessagesPayload): Promise<CreateMessagesReturn> => {
+    capturedMessagesPayload = payload
+    return Promise.resolve(createMessagesResult(payload.model))
+  },
+)
+const createResponses = mock(
+  (
+    payload: ResponsesPayload,
+    options: {
+      transport?: ResponsesTransport
+    },
+  ): Promise<CreateResponsesReturn> => {
+    capturedResponsesPayload = payload
+    capturedResponsesOptions = options
+    return Promise.resolve(createResponsesResult(payload.model))
+  },
+)
 
-await mock.module("~/services/copilot/create-chat-completions", () => ({
-  ...actualChatCompletionsModule,
-  createChatCompletions,
-}))
+const {
+  handleWithChatCompletions,
+  handleWithMessagesApi,
+  handleWithResponsesApi,
+  messagesApiFlowDependencies,
+  prepareCopilotChatCompletionsPayload,
+} = await import("~/routes/messages/api-flows")
+const { responsesUtilsDependencies } = await import("~/routes/responses/utils")
 
-const { handleWithChatCompletions, prepareCopilotChatCompletionsPayload } =
-  await import("../src/routes/messages/api-flows")
+const defaultMessagesApiFlowDependencies = { ...messagesApiFlowDependencies }
+const defaultResponsesUtilsDependencies = { ...responsesUtilsDependencies }
 
 const logger = {
   debug: () => {},
@@ -54,12 +95,37 @@ const createContext = () =>
     json: (body: unknown) => Response.json(body),
   }) as Parameters<typeof handleWithChatCompletions>[0]
 
-beforeEach(() => {
+beforeEach(async () => {
+  process.env[DB_PATH_ENV] = ":memory:"
+  await closeUsageStore()
   capturedPayload = null
+  capturedMessagesPayload = null
+  capturedResponsesPayload = null
+  capturedResponsesOptions = null
+  responsesApiWebSocketEnabled = true
+  messagesApiFlowDependencies.createChatCompletions = createChatCompletions
+  messagesApiFlowDependencies.createMessages = createMessages
+  messagesApiFlowDependencies.createResponses = createResponses
+  responsesUtilsDependencies.getModelResponsesApiCompactThreshold = () =>
+    undefined
+  responsesUtilsDependencies.isContextManagementEnabledForMessages = () => true
+  responsesUtilsDependencies.isContextManagementEnabledForResponses = () =>
+    false
+  responsesUtilsDependencies.isResponsesApiWebSocketEnabled = () =>
+    responsesApiWebSocketEnabled
   createChatCompletions.mockClear()
+  createMessages.mockClear()
+  createResponses.mockClear()
 })
 
-test("messages Chat Completions flow adds Copilot cache control to system and latest two non-system messages", async () => {
+afterEach(async () => {
+  Object.assign(messagesApiFlowDependencies, defaultMessagesApiFlowDependencies)
+  Object.assign(responsesUtilsDependencies, defaultResponsesUtilsDependencies)
+  await closeUsageStore()
+  Reflect.deleteProperty(process.env, DB_PATH_ENV)
+})
+
+test("messages Chat Completions flow adds Copilot cache control to system and latest non-system message", async () => {
   const payload: AnthropicMessagesPayload = {
     model: "gpt-test",
     max_tokens: 128,
@@ -121,9 +187,6 @@ test("messages Chat Completions flow adds Copilot cache control to system and la
     {
       role: "user",
       content: "latest user",
-      copilot_cache_control: {
-        type: "ephemeral",
-      },
     },
     {
       role: "assistant",
@@ -135,7 +198,89 @@ test("messages Chat Completions flow adds Copilot cache control to system and la
   ])
 })
 
-test("Copilot Chat Completions payload preparation marks two system and latest two non-system messages", () => {
+test("messages Chat Completions flow preserves supported reasoning effort", async () => {
+  const payload: AnthropicMessagesPayload = {
+    model: "gpt-test",
+    max_tokens: 128,
+    messages: [{ role: "user", content: "hello" }],
+    output_config: {
+      effort: "medium",
+    },
+  }
+
+  const response = await handleWithChatCompletions(createContext(), payload, {
+    logger,
+    requestId: "request-1",
+    selectedModel: createModel([], {
+      reasoningEffort: ["low", "medium", "high"],
+    }),
+  })
+
+  expect(response.status).toBe(200)
+  expect(capturedPayload?.reasoning_effort).toBe("medium")
+})
+
+test("messages Chat Completions flow downgrades unsupported reasoning effort", async () => {
+  const payload: AnthropicMessagesPayload = {
+    model: "gpt-test",
+    max_tokens: 128,
+    messages: [{ role: "user", content: "hello" }],
+    output_config: {
+      effort: "xhigh",
+    },
+  }
+
+  const response = await handleWithChatCompletions(createContext(), payload, {
+    logger,
+    requestId: "request-1",
+    selectedModel: createModel([], {
+      reasoningEffort: ["low", "medium", "high"],
+    }),
+  })
+
+  expect(response.status).toBe(200)
+  expect(capturedPayload?.reasoning_effort).toBe("high")
+})
+
+test("messages Chat Completions flow omits reasoning effort without model support", async () => {
+  const createPayload = (): AnthropicMessagesPayload => ({
+    model: "gpt-test",
+    max_tokens: 128,
+    messages: [{ role: "user", content: "hello" }],
+    output_config: {
+      effort: "high",
+    },
+  })
+
+  let response = await handleWithChatCompletions(
+    createContext(),
+    createPayload(),
+    {
+      logger,
+      requestId: "request-1",
+      selectedModel: createModel([]),
+    },
+  )
+
+  expect(response.status).toBe(200)
+  expect(capturedPayload).not.toHaveProperty("reasoning_effort")
+
+  capturedPayload = null
+  createChatCompletions.mockClear()
+
+  response = await handleWithChatCompletions(createContext(), createPayload(), {
+    logger,
+    requestId: "request-2",
+    selectedModel: createModel([], {
+      reasoningEffort: [],
+    }),
+  })
+
+  expect(response.status).toBe(200)
+  expect(capturedPayload).not.toHaveProperty("reasoning_effort")
+})
+
+test("Copilot Chat Completions payload preparation marks two system and latest non-system message", () => {
   const payload: ChatCompletionsPayload = {
     model: "gpt-test",
     messages: [
@@ -181,9 +326,6 @@ test("Copilot Chat Completions payload preparation marks two system and latest t
     {
       role: "user",
       content: "latest user",
-      copilot_cache_control: {
-        type: "ephemeral",
-      },
     },
     {
       role: "assistant",
@@ -193,4 +335,442 @@ test("Copilot Chat Completions payload preparation marks two system and latest t
       },
     },
   ])
+})
+
+test("messages Messages flow records Copilot AIU from streaming message delta", async () => {
+  createMessages.mockImplementationOnce(
+    (payload: AnthropicMessagesPayload): Promise<CreateMessagesReturn> => {
+      capturedMessagesPayload = payload
+      return Promise.resolve(
+        createMessagesStream([
+          {
+            event: "message_start",
+            data: JSON.stringify({
+              message: {
+                content: [],
+                id: "msg-test",
+                model: payload.model,
+                role: "assistant",
+                stop_reason: null,
+                stop_sequence: null,
+                type: "message",
+                usage: {
+                  input_tokens: 3,
+                  output_tokens: 0,
+                },
+              },
+              type: "message_start",
+            }),
+          },
+          {
+            event: "message_delta",
+            data: JSON.stringify({
+              copilot_usage: {
+                total_nano_aiu: 4_119_900_000,
+              },
+              delta: {
+                stop_reason: "end_turn",
+                stop_sequence: null,
+              },
+              type: "message_delta",
+              usage: {
+                cache_creation_input_tokens: 10_612,
+                cache_read_input_tokens: 0,
+                input_tokens: 3,
+                output_tokens: 93,
+              },
+            }),
+          },
+          {
+            event: "message_stop",
+            data: JSON.stringify({ type: "message_stop" }),
+          },
+        ]) as unknown as CreateMessagesReturn,
+      )
+    },
+  )
+
+  const payload: AnthropicMessagesPayload = {
+    max_tokens: 128,
+    messages: [{ role: "user", content: "hello" }],
+    model: "claude-sonnet-4.6",
+    stream: true,
+  }
+  const app = new Hono()
+  app.post("/", (c) =>
+    handleWithMessagesApi(c, payload, {
+      logger,
+      requestId: "request-1",
+    }),
+  )
+
+  const response = await app.request("/", { method: "POST" })
+  expect(response.status).toBe(200)
+  await response.text()
+
+  const usageEvents = await getTokenUsageEventsPage({
+    page: 1,
+    pageSize: 10,
+    period: "day",
+  })
+
+  expect(capturedMessagesPayload?.model).toBe("claude-sonnet-4.6")
+  expect(usageEvents.items).toHaveLength(1)
+  expect(usageEvents.items[0]).toMatchObject({
+    cache_creation_input_tokens: 10_612,
+    cache_read_input_tokens: 0,
+    cost: {
+      amount: 0.041199,
+      currency: "USD",
+      source: "copilot_aiu",
+      total_cost_nanos: 41_199_000,
+    },
+    input_tokens: 3,
+    model: "claude-sonnet-4.6",
+    output_tokens: 93,
+    total_nano_aiu: 4_119_900_000,
+  })
+})
+
+test("messages Messages flow records Copilot AIU from non-streaming response", async () => {
+  createMessages.mockImplementationOnce(
+    (payload: AnthropicMessagesPayload): Promise<CreateMessagesReturn> => {
+      capturedMessagesPayload = payload
+      return Promise.resolve({
+        ...createMessagesResult(payload.model),
+        copilot_usage: {
+          total_nano_aiu: 1_000_000_000,
+        },
+        usage: {
+          cache_creation_input_tokens: 200,
+          cache_read_input_tokens: 30,
+          input_tokens: 12,
+          output_tokens: 8,
+        },
+      })
+    },
+  )
+
+  const payload: AnthropicMessagesPayload = {
+    max_tokens: 128,
+    messages: [{ role: "user", content: "hello" }],
+    model: "claude-sonnet-4.6",
+  }
+
+  const response = await handleWithMessagesApi(createContext(), payload, {
+    logger,
+    requestId: "request-1",
+  })
+  expect(response.status).toBe(200)
+  await response.json()
+
+  const usageEvents = await getTokenUsageEventsPage({
+    page: 1,
+    pageSize: 10,
+    period: "day",
+  })
+
+  expect(capturedMessagesPayload?.model).toBe("claude-sonnet-4.6")
+  expect(usageEvents.items).toHaveLength(1)
+  expect(usageEvents.items[0]).toMatchObject({
+    cache_creation_input_tokens: 200,
+    cache_read_input_tokens: 30,
+    cost: {
+      amount: 0.01,
+      currency: "USD",
+      source: "copilot_aiu",
+      total_cost_nanos: 10_000_000,
+    },
+    input_tokens: 12,
+    model: "claude-sonnet-4.6",
+    output_tokens: 8,
+    total_nano_aiu: 1_000_000_000,
+  })
+})
+
+test("messages Responses flow uses websocket transport by default for dual-endpoint models", async () => {
+  const payload: AnthropicMessagesPayload = {
+    max_tokens: 128,
+    messages: [{ role: "user", content: "hello" }],
+    model: "gpt-test",
+  }
+
+  const response = await handleWithResponsesApi(createContext(), payload, {
+    logger,
+    requestId: "request-1",
+    selectedModel: createModel(["/responses", "ws:/responses"]),
+  })
+
+  expect(response.status).toBe(200)
+  expect(createResponses).toHaveBeenCalledTimes(1)
+  expect(capturedResponsesOptions?.transport).toBe("websocket")
+})
+
+test("messages Responses flow adds context management by default", async () => {
+  const payload: AnthropicMessagesPayload = {
+    max_tokens: 128,
+    messages: [{ role: "user", content: "hello" }],
+    model: "gpt-test",
+  }
+
+  const response = await handleWithResponsesApi(createContext(), payload, {
+    logger,
+    requestId: "request-1",
+    selectedModel: createModel(["/responses"]),
+  })
+
+  expect(response.status).toBe(200)
+  expect(createResponses).toHaveBeenCalledTimes(1)
+  expect(capturedResponsesPayload?.context_management).toEqual([
+    {
+      type: "compaction",
+      compact_threshold: 108800,
+    },
+  ])
+})
+
+test("messages Responses flow disables context management for gpt-5.6 models", async () => {
+  const payload: AnthropicMessagesPayload = {
+    max_tokens: 128,
+    messages: [{ role: "user", content: "hello" }],
+    model: "gpt-5.6-sol",
+  }
+
+  const response = await handleWithResponsesApi(createContext(), payload, {
+    logger,
+    requestId: "request-1",
+    selectedModel: createModel(["/responses"]),
+  })
+
+  expect(response.status).toBe(200)
+  expect(createResponses).toHaveBeenCalledTimes(1)
+  expect(capturedResponsesPayload?.context_management).toBeUndefined()
+})
+
+test("messages Responses flow keeps HTTP transport for dual-endpoint models when websocket is disabled", async () => {
+  responsesApiWebSocketEnabled = false
+  const payload: AnthropicMessagesPayload = {
+    max_tokens: 128,
+    messages: [{ role: "user", content: "hello" }],
+    model: "gpt-test",
+  }
+
+  const response = await handleWithResponsesApi(createContext(), payload, {
+    logger,
+    requestId: "request-1",
+    selectedModel: createModel(["/responses", "ws:/responses"]),
+  })
+
+  expect(response.status).toBe(200)
+  expect(createResponses).toHaveBeenCalledTimes(1)
+  expect(capturedResponsesOptions?.transport).toBe("http")
+})
+
+test("messages Responses flow keeps HTTP transport for compact requests", async () => {
+  const payload: AnthropicMessagesPayload = {
+    max_tokens: 128,
+    messages: [{ role: "user", content: "compact" }],
+    model: "gpt-test",
+  }
+
+  const response = await handleWithResponsesApi(createContext(), payload, {
+    compactType: COMPACT_REQUEST,
+    logger,
+    requestId: "request-1",
+    selectedModel: createModel(["/responses", "ws:/responses"]),
+  })
+
+  expect(response.status).toBe(200)
+  expect(createResponses).toHaveBeenCalledTimes(1)
+  expect(capturedResponsesOptions?.transport).toBe("http")
+})
+
+test("messages Responses flow keeps HTTP transport for /responses-only models", async () => {
+  const payload: AnthropicMessagesPayload = {
+    max_tokens: 128,
+    messages: [{ role: "user", content: "hello" }],
+    model: "gpt-test",
+  }
+
+  const response = await handleWithResponsesApi(createContext(), payload, {
+    logger,
+    requestId: "request-1",
+    selectedModel: createModel(["/responses"]),
+  })
+
+  expect(response.status).toBe(200)
+  expect(createResponses).toHaveBeenCalledTimes(1)
+  expect(capturedResponsesOptions?.transport).toBe("http")
+})
+
+test("messages Responses flow keeps streaming transport for deferred tool search", async () => {
+  const payload: AnthropicMessagesPayload = {
+    max_tokens: 128,
+    stream: true,
+    messages: [{ role: "user", content: "fetch a page" }],
+    model: "gpt-5.4",
+    tools: [
+      {
+        name: "mcp__tool_search__search",
+        input_schema: { type: "object" },
+      },
+      {
+        name: "mcp__fetch__fetch",
+        description: "Fetch a URL",
+        input_schema: { type: "object" },
+      },
+    ],
+  }
+
+  const response = await handleWithResponsesApi(createContext(), payload, {
+    logger,
+    requestId: "request-1",
+    selectedModel: createModel(["/responses", "ws:/responses"]),
+  })
+
+  expect(response.status).toBe(200)
+  expect(createResponses).toHaveBeenCalledTimes(1)
+  expect(capturedResponsesPayload?.stream).toBe(true)
+  expect(capturedResponsesOptions?.transport).toBe("websocket")
+})
+
+test("messages Responses flow preserves the configured tool_search alias in non-streaming responses", async () => {
+  createResponses.mockImplementationOnce(
+    (
+      payload: ResponsesPayload,
+      options: { transport?: ResponsesTransport },
+    ) => {
+      capturedResponsesPayload = payload
+      capturedResponsesOptions = options
+      return Promise.resolve({
+        ...createResponsesResult(payload.model),
+        output: [
+          {
+            id: "search-1",
+            type: "tool_search_call",
+            call_id: "call_search",
+            arguments: { names: ["mcp__fetch__fetch"] },
+            status: "completed",
+          },
+        ],
+      })
+    },
+  )
+
+  const payload: AnthropicMessagesPayload = {
+    max_tokens: 128,
+    messages: [{ role: "user", content: "fetch a page" }],
+    model: "gpt-5.4",
+    tools: [
+      {
+        name: "tool_search_search",
+        input_schema: { type: "object" },
+      },
+      {
+        name: "mcp__fetch__fetch",
+        description: "Fetch a URL",
+        input_schema: { type: "object" },
+      },
+    ],
+  }
+
+  const response = await handleWithResponsesApi(createContext(), payload, {
+    logger,
+    requestId: "request-1",
+    selectedModel: createModel(["/responses"]),
+  })
+
+  expect(response.status).toBe(200)
+  expect(await response.json()).toEqual({
+    id: "resp-test",
+    type: "message",
+    role: "assistant",
+    content: [
+      {
+        type: "tool_use",
+        id: "call_search",
+        name: "tool_search_search",
+        input: {
+          names: "mcp__fetch__fetch",
+        },
+      },
+    ],
+    model: "gpt-5.4",
+    stop_reason: "tool_use",
+    stop_sequence: null,
+    usage: {
+      input_tokens: 0,
+      output_tokens: 0,
+    },
+  })
+})
+
+const createModel = (
+  supportedEndpoints: Array<string>,
+  options: { reasoningEffort?: Array<string> } = {},
+): Model => ({
+  capabilities: {
+    family: "gpt",
+    limits: {
+      max_prompt_tokens: 128000,
+    },
+    object: "model_capabilities",
+    supports:
+      options.reasoningEffort === undefined ?
+        {}
+      : { reasoning_effort: options.reasoningEffort },
+    tokenizer: "o200k_base",
+    type: "chat",
+  },
+  id: "gpt-test",
+  model_picker_enabled: true,
+  name: "gpt-test",
+  object: "model",
+  preview: false,
+  supported_endpoints: supportedEndpoints,
+  vendor: "openai",
+  version: "1",
+})
+
+const createMessagesResult = (model: string): AnthropicResponse => ({
+  content: [],
+  id: "msg-test",
+  model,
+  role: "assistant",
+  stop_reason: "end_turn",
+  stop_sequence: null,
+  type: "message",
+  usage: {
+    input_tokens: 0,
+    output_tokens: 0,
+  },
+})
+
+async function* createMessagesStream(
+  events: Array<{ data: string; event: string }>,
+): AsyncGenerator<{ data: string; event: string }> {
+  for (const event of events) {
+    await Promise.resolve()
+    yield event
+  }
+}
+
+const createResponsesResult = (model: string): ResponsesResult => ({
+  created_at: 0,
+  error: null,
+  id: "resp-test",
+  incomplete_details: null,
+  instructions: null,
+  metadata: null,
+  model,
+  object: "response",
+  output: [],
+  output_text: "",
+  parallel_tool_calls: false,
+  status: "completed",
+  temperature: null,
+  tool_choice: "auto",
+  tools: [],
+  top_p: null,
+  usage: null,
 })

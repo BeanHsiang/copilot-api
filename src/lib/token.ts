@@ -1,19 +1,30 @@
 import consola from "consola"
-import fs from "node:fs/promises"
 import { setTimeout as delay } from "node:timers/promises"
 
 import { isOpencodeOauthApp } from "~/lib/api-config"
-import { PATHS } from "~/lib/paths"
+import { getRawProviderConfig, setProviderConfig } from "~/lib/config"
+import {
+  readCodexCredentials,
+  readGitHubToken,
+  writeCodexCredentials,
+  writeGitHubToken,
+} from "~/lib/credential-store"
+import {
+  isCodexCredentialsExpired,
+  refreshCodexCredentials,
+  type CodexCredentials,
+} from "~/lib/oauth/codex"
+import { CODEX_API_BASE_URL } from "~/services/codex/create-responses"
 import { getCopilotToken } from "~/services/github/get-copilot-token"
 import { getCopilotUsage } from "~/services/github/get-copilot-usage"
 import { getDeviceCode } from "~/services/github/get-device-code"
-import { getGitHubUser } from "~/services/github/get-user"
 import { pollAccessToken } from "~/services/github/poll-access-token"
 
 import { HTTPError } from "./error"
 import { state } from "./state"
 
 let copilotRefreshLoopController: AbortController | null = null
+let codexRefreshLoopController: AbortController | null = null
 
 export const stopCopilotRefreshLoop = () => {
   if (!copilotRefreshLoopController) {
@@ -24,10 +35,67 @@ export const stopCopilotRefreshLoop = () => {
   copilotRefreshLoopController = null
 }
 
-const readGithubToken = () => fs.readFile(PATHS.GITHUB_TOKEN_PATH, "utf8")
+export const stopCodexRefreshLoop = () => {
+  if (!codexRefreshLoopController) {
+    return
+  }
 
-const writeGithubToken = (token: string) =>
-  fs.writeFile(PATHS.GITHUB_TOKEN_PATH, token)
+  codexRefreshLoopController.abort()
+  codexRefreshLoopController = null
+}
+
+function applyCodexCredentials(credentials: CodexCredentials): void {
+  state.codexAccessToken = credentials.accessToken
+  state.codexRefreshToken = credentials.refreshToken
+  state.codexExpiresAt = credentials.expiresAt
+  state.codexAccountId = credentials.accountId
+
+  consola.debug("Codex credentials loaded successfully")
+  if (state.showToken) {
+    consola.info("Codex access token:", credentials.accessToken)
+  }
+}
+
+function getLoadedCodexCredentials(): CodexCredentials | null {
+  if (
+    !state.codexAccessToken
+    || !state.codexRefreshToken
+    || !state.codexExpiresAt
+    || !state.codexAccountId
+  ) {
+    return null
+  }
+
+  return {
+    accessToken: state.codexAccessToken,
+    refreshToken: state.codexRefreshToken,
+    expiresAt: state.codexExpiresAt,
+    accountId: state.codexAccountId,
+  }
+}
+
+function syncCodexProviderConfig(options?: { enabled?: boolean }): void {
+  const existingProviderConfig = getRawProviderConfig("codex") ?? {}
+  setProviderConfig("codex", {
+    ...existingProviderConfig,
+    type: "openai-responses",
+    enabled: options?.enabled ?? existingProviderConfig.enabled,
+    baseUrl: CODEX_API_BASE_URL,
+    authType: "oauth2",
+    pricingCurrency: "USD",
+  })
+}
+
+export async function persistCodexCredentials(
+  credentials: CodexCredentials,
+  options?: { enableProvider?: boolean },
+): Promise<void> {
+  await writeCodexCredentials(credentials)
+  syncCodexProviderConfig({
+    enabled: options?.enableProvider ? true : undefined,
+  })
+  applyCodexCredentials(credentials)
+}
 
 export const setupCopilotToken = async () => {
   if (isOpencodeOauthApp()) {
@@ -69,9 +137,54 @@ export const setupCopilotToken = async () => {
     })
 }
 
+export const setupCodexToken = async (): Promise<void> => {
+  const loadedCredentials = getLoadedCodexCredentials()
+  if (loadedCredentials && !isCodexCredentialsExpired(loadedCredentials)) {
+    if (codexRefreshLoopController) {
+      return
+    }
+
+    applyCodexCredentials(loadedCredentials)
+  }
+
+  const credentials = loadedCredentials ?? (await readCodexCredentials())
+  if (!credentials) {
+    throw new Error(
+      `Codex credentials not found. Run \`copilot-api auth login --provider codex\` first.`,
+    )
+  }
+
+  syncCodexProviderConfig()
+
+  let nextCredentials = credentials
+  if (isCodexCredentialsExpired(credentials)) {
+    consola.debug("Refreshing expired Codex credentials")
+    nextCredentials = await refreshCodexCredentials(credentials)
+    await persistCodexCredentials(nextCredentials)
+  }
+
+  applyCodexCredentials(nextCredentials)
+  stopCodexRefreshLoop()
+
+  const controller = new AbortController()
+  codexRefreshLoopController = controller
+
+  runCodexRefreshLoop(controller.signal)
+    .catch(() => {
+      consola.warn("Codex token refresh loop stopped")
+    })
+    .finally(() => {
+      if (codexRefreshLoopController === controller) {
+        codexRefreshLoopController = null
+      }
+    })
+}
+
 const REFRESH_POLL_INTERVAL_MS = 15_000
 const EARLY_REFRESH_BUFFER_MS = 60_000
 const RETRY_REFRESH_DELAY_MS = 15_000
+const MAX_RETRY_REFRESH_DELAY_MS = 600_000
+const RETRY_REFRESH_JITTER_MS = 15_000
 const MIN_REFRESH_DELAY_MS = 1_000
 
 export const getRefreshDeadlineMs = (
@@ -93,6 +206,7 @@ const runCopilotRefreshLoop = async (
   signal: AbortSignal,
 ) => {
   let refreshAtMs = getRefreshDeadlineMs(refreshIn)
+  let retryDelayMs = RETRY_REFRESH_DELAY_MS
 
   while (!signal.aborted) {
     const nextDelayMs = getRefreshPollDelayMs(refreshAtMs)
@@ -107,15 +221,65 @@ const runCopilotRefreshLoop = async (
       const { token, refresh_in } = await getCopilotToken()
       state.copilotToken = token
       refreshAtMs = getRefreshDeadlineMs(refresh_in)
+      retryDelayMs = RETRY_REFRESH_DELAY_MS
       consola.debug("Copilot token refreshed")
       if (state.showToken) {
         consola.info("Refreshed Copilot token:", token)
       }
     } catch (error) {
       consola.error("Failed to refresh Copilot token:", error)
+      const delayMs = Math.min(
+        retryDelayMs + Math.floor(Math.random() * RETRY_REFRESH_JITTER_MS),
+        MAX_RETRY_REFRESH_DELAY_MS,
+      )
+      refreshAtMs = Date.now() + delayMs
+      retryDelayMs = Math.min(retryDelayMs * 2, MAX_RETRY_REFRESH_DELAY_MS)
+      consola.warn(
+        `Retrying Copilot token refresh in ${Math.round(delayMs / 1000)}s`,
+      )
+    }
+  }
+}
+
+const runCodexRefreshLoop = async (signal: AbortSignal) => {
+  let refreshAtMs = Math.max(
+    (state.codexExpiresAt ?? Date.now()) - EARLY_REFRESH_BUFFER_MS,
+    Date.now(),
+  )
+
+  while (!signal.aborted) {
+    const expiresAt = state.codexExpiresAt
+    const refreshToken = state.codexRefreshToken
+    if (!expiresAt || !refreshToken) {
+      return
+    }
+
+    const nextDelayMs = getRefreshPollDelayMs(refreshAtMs)
+    if (nextDelayMs > 0) {
+      await delay(nextDelayMs, undefined, { signal })
+      continue
+    }
+
+    consola.debug("Refreshing Codex credentials")
+
+    try {
+      const credentials = await refreshCodexCredentials({
+        accessToken: state.codexAccessToken ?? "",
+        refreshToken,
+        expiresAt,
+        accountId: state.codexAccountId ?? "",
+      })
+      await persistCodexCredentials(credentials)
+      refreshAtMs = Math.max(
+        credentials.expiresAt - EARLY_REFRESH_BUFFER_MS,
+        Date.now(),
+      )
+      consola.debug("Codex credentials refreshed")
+    } catch (error) {
+      consola.error("Failed to refresh Codex credentials:", error)
       refreshAtMs = Date.now() + RETRY_REFRESH_DELAY_MS
       consola.warn(
-        `Retrying Copilot token refresh in ${RETRY_REFRESH_DELAY_MS / 1000}s`,
+        `Retrying Codex token refresh in ${RETRY_REFRESH_DELAY_MS / 1000}s`,
       )
     }
   }
@@ -129,7 +293,7 @@ export async function setupGitHubToken(
   options?: SetupGitHubTokenOptions,
 ): Promise<void> {
   try {
-    const githubToken = await readGithubToken()
+    const githubToken = await readGitHubToken()
 
     if (githubToken && !options?.force) {
       state.githubToken = githubToken
@@ -150,7 +314,7 @@ export async function setupGitHubToken(
     )
 
     const token = await pollAccessToken(response)
-    await writeGithubToken(token)
+    await writeGitHubToken(token)
     state.githubToken = token
 
     if (state.showToken) {
@@ -169,10 +333,14 @@ export async function setupGitHubToken(
 }
 
 export async function logUser() {
-  const user = await getGitHubUser()
-  state.userName = user.login
-  consola.info(`Logged in as ${user.login}`)
-
   const copilotUser = await getCopilotUsage()
+  if (!copilotUser) {
+    throw new Error("GitHub token not found")
+  }
+
+  state.userName = copilotUser.login
+  consola.info(`Logged in as ${copilotUser.login}`)
+
   state.copilotApiUrl = copilotUser.endpoints.api
+  state.tokenBasedBilling = copilotUser.token_based_billing
 }

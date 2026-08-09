@@ -2,13 +2,13 @@ import {
   type ChatCompletionChunk,
   type Choice,
   type Delta,
-} from "~/services/copilot/create-chat-completions"
+} from "~/lib/types/chat-completions"
 
 import {
   type AnthropicMessageDeltaEvent,
   type AnthropicStreamEventData,
   type AnthropicStreamState,
-} from "./anthropic-types"
+} from "~/lib/types/anthropic"
 import { THINKING_TEXT } from "./non-stream-translation"
 import { mapOpenAIStopReasonToAnthropic } from "./utils"
 
@@ -29,7 +29,13 @@ export function translateChunkToAnthropicEvents(
   const events: Array<AnthropicStreamEventData> = []
 
   if (chunk.choices.length === 0) {
-    completePendingMessage(state, events, chunk)
+    // Empty-choices chunks without usage are metadata-only events (e.g.
+    // inference cost) that may arrive before the final usage chunk. Only
+    // complete the pending message when usage is present; otherwise wait
+    // for the usage chunk or the final stream flush.
+    if (chunk.usage) {
+      completePendingMessage(state, events, chunk)
+    }
     return events
   }
 

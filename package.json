@@ -1,14 +1,13 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
   "name": "@jeffreycao/copilot-api",
-  "version": "1.9.15",
-  "description": "OpenAI and Anthropic-compatible gateway for GitHub Copilot or third-party providers.",
+  "version": "1.16.1",
+  "description": "GitHub Copilot, OpenAI Codex, OpenCode Go, and third-party AI provider gateway with OpenAI and Anthropic API compatibility.",
   "keywords": [
-    "dashboard",
-    "multi-provider",
     "github-copilot",
+    "codex",
     "ai-gateway",
-    "openai-compatible",
+    "opencode",
     "anthropic-compatible"
   ],
   "homepage": "https://github.com/caozhiyuan/copilot-api",
@@ -30,14 +29,14 @@
   "scripts": {
     "build": "tsdown",
     "build:desktop": "tsdown --config tsdown.desktop.config.ts",
-    "dev": "bun run --watch ./src/main.ts",
+    "dev": "NODE_USE_SYSTEM_CA=1 bun run --watch ./src/main.ts",
     "knip": "knip-bun",
     "lint": "eslint --cache",
     "lint:all": "eslint --cache .",
     "prepack": "bun run build",
     "prepare": "simple-git-hooks",
     "release": "bumpp && bun publish --access public",
-    "start": "NODE_ENV=production bun run ./src/main.ts",
+    "start": "NODE_USE_SYSTEM_CA=1 NODE_ENV=production bun run ./src/main.ts",
     "typecheck": "tsc"
   },
   "simple-git-hooks": {
@@ -50,10 +49,12 @@
     "rolldown": "1.0.0-rc.18"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "citty": "^0.1.6",
     "clipboardy": "^5.0.0",
     "consola": "^3.4.2",
     "fetch-event-stream": "^0.1.5",
+    "fzstd": "^0.1.1",
     "gpt-tokenizer": "^3.0.1",
     "hono": "^4.9.9",
     "proxy-from-env": "^1.1.0",

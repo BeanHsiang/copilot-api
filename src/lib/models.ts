@@ -1,6 +1,24 @@
-import type { Model } from "~/services/copilot/get-models"
+import type { Model } from "~/lib/types/models"
 
 import { state } from "~/lib/state"
+
+/**
+ * Converts a Copilot upstream model ID to a client-friendly ID that Claude Code
+ * and Claude Desktop recognize (dots in version replaced with hyphens).
+ * e.g. "claude-sonnet-4.6" -> "claude-sonnet-4-6"
+ * Non-Claude models are returned unchanged.
+ */
+export const toClientModelId = (modelId: string): string => {
+  const normalized = normalizeSdkModelId(modelId)
+  if (!normalized) return modelId
+  const versionHyphenated = normalized.version.replaceAll(".", "-")
+  return `claude-${normalized.family}-${versionHyphenated}`
+}
+
+export interface NormalizedSdkModelId {
+  family: string
+  version: string
+}
 
 export const findEndpointModel = (sdkModelId: string): Model | undefined => {
   const models = state.models?.data ?? []
@@ -9,7 +27,7 @@ export const findEndpointModel = (sdkModelId: string): Model | undefined => {
     return exactMatch
   }
 
-  const normalized = _normalizeSdkModelId(sdkModelId)
+  const normalized = normalizeSdkModelId(sdkModelId)
   if (!normalized) {
     return undefined
   }
@@ -24,6 +42,42 @@ export const findEndpointModel = (sdkModelId: string): Model | undefined => {
 }
 
 /**
+ * Finds the latest available model for a given Claude family (e.g. "opus",
+ * "sonnet", "haiku") among the models currently cached in `state.models`.
+ * "Latest" is determined by the highest semantic version parsed from the model
+ * ID. Returns `undefined` when no model of that family is available.
+ */
+export const getLatestModelForFamily = (family: string): Model | undefined => {
+  const models = state.models?.data ?? []
+
+  let best: { model: Model; major: number; minor: number } | undefined
+
+  for (const model of models) {
+    const normalized = normalizeSdkModelId(model.id)
+    if (!normalized || normalized.family !== family) {
+      continue
+    }
+
+    const [majorPart, minorPart = "0"] = normalized.version.split(".")
+    const major = Number.parseInt(majorPart, 10)
+    const minor = Number.parseInt(minorPart, 10)
+    if (Number.isNaN(major) || Number.isNaN(minor)) {
+      continue
+    }
+
+    if (
+      !best
+      || major > best.major
+      || (major === best.major && minor > best.minor)
+    ) {
+      best = { model, major, minor }
+    }
+  }
+
+  return best?.model
+}
+
+/**
  * Normalizes an SDK model ID to extract the model family and version.
  * this method from github copilot extension
  * Examples:
@@ -33,30 +87,30 @@ export const findEndpointModel = (sdkModelId: string): Model | undefined => {
  * - "claude-haiku-3-5-20250514" -> { family: "haiku", version: "3.5" }
  * - "claude-haiku-4.5" -> { family: "haiku", version: "4.5" }
  */
-const _normalizeSdkModelId = (
+export const normalizeSdkModelId = (
   sdkModelId: string,
-): { family: string; version: string } | undefined => {
+): NormalizedSdkModelId | undefined => {
   const lower = sdkModelId.toLowerCase()
 
   // Strip date suffix (8 digits at the end)
   const withoutDate = lower.replace(/-\d{8}$/, "")
 
-  // Pattern 1: claude-{family}-{major}-{minor} (e.g., claude-opus-4-5, claude-haiku-3-5)
-  const pattern1 = withoutDate.match(/^claude-(\w+)-(\d+)-(\d+)$/)
+  // Pattern 1: claude-{family}-{major}.{minor} (e.g., claude-haiku-4.5)
+  const pattern1 = withoutDate.match(/^claude-(\w+)-(\d+)\.(\d+)$/)
   if (pattern1) {
     return { family: pattern1[1], version: `${pattern1[2]}.${pattern1[3]}` }
   }
 
-  // Pattern 2: claude-{major}-{minor}-{family} (e.g., claude-3-5-sonnet)
-  const pattern2 = withoutDate.match(/^claude-(\d+)-(\d+)-(\w+)$/)
+  // Pattern 2: claude-{family}-{major}-{minor} (e.g., claude-opus-4-5, claude-haiku-3-5)
+  const pattern2 = withoutDate.match(/^claude-(\w+)-(\d+)-(\d+)$/)
   if (pattern2) {
-    return { family: pattern2[3], version: `${pattern2[1]}.${pattern2[2]}` }
+    return { family: pattern2[1], version: `${pattern2[2]}.${pattern2[3]}` }
   }
 
-  // Pattern 3: claude-{family}-{major}.{minor} (e.g., claude-haiku-4.5)
-  const pattern3 = withoutDate.match(/^claude-(\w+)-(\d+)\.(\d+)$/)
+  // Pattern 3: claude-{major}-{minor}-{family} (e.g., claude-3-5-sonnet)
+  const pattern3 = withoutDate.match(/^claude-(\d+)-(\d+)-(\w+)$/)
   if (pattern3) {
-    return { family: pattern3[1], version: `${pattern3[2]}.${pattern3[3]}` }
+    return { family: pattern3[3], version: `${pattern3[1]}.${pattern3[2]}` }
   }
 
   // Pattern 4: claude-{family}-{major} (e.g., claude-sonnet-4)

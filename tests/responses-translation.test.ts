@@ -1,13 +1,19 @@
 import { describe, expect, it } from "bun:test"
 
-import type { AnthropicMessagesPayload } from "~/routes/messages/anthropic-types"
+import { requestContext } from "~/lib/request-context"
+import { createMcpToolSearchSentinel } from "~/lib/tool-search"
+import type { AnthropicMessagesPayload } from "~/lib/types/anthropic"
 import type {
   ResponseFunctionCallOutputItem,
   ResponseInputMessage,
+  ResponseInputReasoning,
+  ResponseToolSearchCallItem,
+  ResponseToolSearchOutputItem,
   ResponsesResult,
-} from "~/services/copilot/create-responses"
+} from "~/lib/types/responses"
 
 import {
+  REASONING_SUMMARY_SEPARATOR,
   translateAnthropicMessagesToResponsesPayload,
   translateResponsesResultToAnthropic,
 } from "~/routes/messages/responses-translation"
@@ -47,6 +53,18 @@ const samplePayload = {
   ],
 } as unknown as AnthropicMessagesPayload
 
+const sampleTools = [
+  {
+    name: "getWeather",
+    description: "Gets weather info",
+    input_schema: {
+      location: {
+        type: "string",
+      },
+    },
+  },
+]
+
 const jsonStyleUserId = JSON.stringify({
   device_id: "3f4a1b7c8d9e0f1234567890abcdef1234567890abcdef1234567890abcdef12",
   account_uuid: "",
@@ -56,7 +74,70 @@ const jsonStyleUserId = JSON.stringify({
 const legacyStyleUserId =
   "user_8b7e2c1d4f6a9b3c0d1e2f3456789abcdeffedcba9876543210fedcba1234567_account__session_7d0e2f61-4b5c-4a9d-8f11-2c3d4e5f6a7b"
 
+const emptySessionUserId = JSON.stringify({
+  device_id: "3f4a1b7c8d9e0f1234567890abcdef1234567890abcdef1234567890abcdef12",
+  account_uuid: "",
+  session_id: "",
+})
+
+const subagentAgentId = "agent-123"
+
+const translateThinking = (thinking: string): ResponseInputReasoning => {
+  const result = translateAnthropicMessagesToResponsesPayload({
+    ...samplePayload,
+    messages: [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "thinking",
+            thinking,
+            signature: "encrypted-content@reasoning-id",
+          },
+        ],
+      },
+    ],
+  })
+
+  return (result.input as Array<ResponseInputReasoning>)[0]
+}
+
 describe("translateAnthropicMessagesToResponsesPayload", () => {
+  it("keeps empty summaries compatible with legacy Thinking markers", () => {
+    expect(translateThinking("").summary).toEqual([])
+    expect(translateThinking("Thinking...").summary).toEqual([])
+  })
+
+  it("restores marked summary boundaries and preserves unmarked history", () => {
+    const firstSummary =
+      "**Preparing to search online**\n\nI need to use web.run."
+    const secondSummary = "**Running the search**"
+    const unmarkedThinking =
+      "**Preparing**\n\nDescription\n\n**A bold body line**\n\nMore text"
+    const marked = translateThinking(
+      firstSummary + REASONING_SUMMARY_SEPARATOR + secondSummary,
+    )
+
+    expect(marked.summary).toEqual([
+      { type: "summary_text", text: firstSummary },
+      { type: "summary_text", text: secondSummary },
+    ])
+    expect(translateThinking(unmarkedThinking).summary).toEqual([
+      { type: "summary_text", text: unmarkedThinking },
+    ])
+  })
+
+  it("prefers the requested output_config reasoning effort", () => {
+    const result = translateAnthropicMessagesToResponsesPayload({
+      ...samplePayload,
+      output_config: {
+        effort: "xhigh",
+      },
+    })
+
+    expect(result.reasoning?.effort).toBe("xhigh")
+  })
+
   it("converts anthropic text blocks into response input messages", () => {
     const result = translateAnthropicMessagesToResponsesPayload(samplePayload)
 
@@ -84,9 +165,27 @@ describe("translateAnthropicMessagesToResponsesPayload", () => {
       metadata: {
         user_id: jsonStyleUserId,
       },
+      tools: sampleTools,
     })
 
     expect(result.prompt_cache_key).toBe("2c4e1cf0-7a67-4d2e-9a4b-1d16d3f44752")
+  })
+
+  it("appends subagent agent_id to metadata prompt cache key", () => {
+    const result = translateAnthropicMessagesToResponsesPayload(
+      {
+        ...samplePayload,
+        metadata: {
+          user_id: jsonStyleUserId,
+        },
+        tools: sampleTools,
+      },
+      ` ${subagentAgentId} `,
+    )
+
+    expect(result.prompt_cache_key).toBe(
+      "2c4e1cf0-7a67-4d2e-9a4b-1d16d3f44752:agent:agent-123",
+    )
   })
 
   it("keeps legacy user_id parsing before JSON fallback", () => {
@@ -95,9 +194,137 @@ describe("translateAnthropicMessagesToResponsesPayload", () => {
       metadata: {
         user_id: legacyStyleUserId,
       },
+      tools: sampleTools,
     })
 
     expect(result.prompt_cache_key).toBe("7d0e2f61-4b5c-4a9d-8f11-2c3d4e5f6a7b")
+  })
+
+  it("falls back to session affinity when metadata session id is empty", () => {
+    const result = requestContext.run(
+      {
+        parentSessionId: undefined,
+        sessionAffinity: "opencode-session",
+        startTime: Date.now(),
+        traceId: "trace-123",
+        userAgent: "test",
+      },
+      () =>
+        translateAnthropicMessagesToResponsesPayload({
+          ...samplePayload,
+          metadata: {
+            user_id: emptySessionUserId,
+          },
+          tools: sampleTools,
+        }),
+    )
+
+    expect(result.prompt_cache_key).toBe("opencode-session")
+  })
+
+  it("appends subagent agent_id to session affinity fallback", () => {
+    const result = requestContext.run(
+      {
+        parentSessionId: undefined,
+        sessionAffinity: "opencode-session",
+        startTime: Date.now(),
+        traceId: "trace-123",
+        userAgent: "test",
+      },
+      () =>
+        translateAnthropicMessagesToResponsesPayload(
+          {
+            ...samplePayload,
+            metadata: {
+              user_id: emptySessionUserId,
+            },
+            tools: sampleTools,
+          },
+          ` ${subagentAgentId} `,
+        ),
+    )
+
+    expect(result.prompt_cache_key).toBe("opencode-session:agent:agent-123")
+  })
+
+  it("keeps unrelated system prompt text unchanged", () => {
+    const payload = {
+      model: "gpt-5.4",
+      max_tokens: 1024,
+      system: [
+        {
+          type: "text",
+          text: "ordinary system prompt",
+        },
+      ],
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "text", text: "hello gpt54" }],
+        },
+      ],
+    } as unknown as AnthropicMessagesPayload
+
+    const result = translateAnthropicMessagesToResponsesPayload(payload)
+
+    expect(result.instructions).toContain("ordinary system prompt")
+    expect(result.instructions).not.toContain("cch=<stable>;")
+  })
+
+  it("ignores blank subagent agent_id", () => {
+    const result = translateAnthropicMessagesToResponsesPayload(
+      {
+        ...samplePayload,
+        metadata: {
+          user_id: jsonStyleUserId,
+        },
+        tools: sampleTools,
+      },
+      "   ",
+    )
+
+    expect(result.prompt_cache_key).toBe("2c4e1cf0-7a67-4d2e-9a4b-1d16d3f44752")
+  })
+
+  it("keeps prompt_cache_key null when only subagent agent_id is provided", () => {
+    const result = translateAnthropicMessagesToResponsesPayload(
+      {
+        ...samplePayload,
+        tools: sampleTools,
+      },
+      subagentAgentId,
+    )
+
+    expect(result.prompt_cache_key).toBeNull()
+  })
+
+  it("omits prompt_cache_key when tools are missing", () => {
+    const result = translateAnthropicMessagesToResponsesPayload(
+      {
+        ...samplePayload,
+        metadata: {
+          user_id: jsonStyleUserId,
+        },
+      },
+      subagentAgentId,
+    )
+
+    expect(result).not.toHaveProperty("prompt_cache_key")
+  })
+
+  it("omits prompt_cache_key when tools are empty", () => {
+    const result = translateAnthropicMessagesToResponsesPayload(
+      {
+        ...samplePayload,
+        metadata: {
+          user_id: jsonStyleUserId,
+        },
+        tools: [],
+      },
+      subagentAgentId,
+    )
+
+    expect(result).not.toHaveProperty("prompt_cache_key")
   })
 
   it("maps tool_reference tool results into function_call_output text", () => {
@@ -183,6 +410,461 @@ describe("translateAnthropicMessagesToResponsesPayload", () => {
       },
     ])
   })
+
+  it("converts bridge and deferred tools into Responses tool_search and namespaces", () => {
+    const result = translateAnthropicMessagesToResponsesPayload({
+      model: "gpt-5.4",
+      max_tokens: 1024,
+      messages: [{ role: "user", content: "fetch a page" }],
+      tools: [
+        {
+          name: "mcp__tool_search__search",
+          description: "Search deferred tools",
+          input_schema: {
+            type: "object",
+            properties: {
+              names: { type: "string" },
+            },
+            required: ["names"],
+          },
+        },
+        {
+          name: "mcp__fetch__fetch",
+          description: "Fetch a URL",
+          input_schema: {
+            type: "object",
+            properties: {
+              url: { type: "string" },
+            },
+            required: ["url"],
+          },
+        },
+        {
+          name: "chrome-devtools_click",
+          description: "Click an element",
+          input_schema: {
+            type: "object",
+            properties: {
+              uid: { type: "string" },
+            },
+            required: ["uid"],
+          },
+        },
+        {
+          name: "Read",
+          description: "Read a file",
+          input_schema: {
+            type: "object",
+            properties: {
+              file_path: { type: "string" },
+            },
+            required: ["file_path"],
+          },
+        },
+      ],
+    })
+
+    expect(result.parallel_tool_calls).toBe(true)
+    expect(result.tools).toEqual([
+      {
+        type: "tool_search",
+        execution: "client",
+        description:
+          "Load deferred tools by exact name before using them. Return only the searchable tool names you need for the next step.",
+        parameters: {
+          type: "object",
+          properties: {
+            names: {
+              type: "array",
+              description: "Exact deferred tool names to load.",
+              items: {
+                type: "string",
+                enum: ["mcp__fetch__fetch", "chrome-devtools_click"],
+              },
+              minItems: 1,
+            },
+          },
+          required: ["names"],
+          additionalProperties: false,
+        },
+      },
+      {
+        type: "namespace",
+        name: "mcp__fetch__fetch",
+        description: "Fetch a URL",
+        tools: [
+          {
+            type: "function",
+            name: "mcp__fetch__fetch",
+            description: "Fetch a URL",
+            parameters: {
+              type: "object",
+              properties: {
+                url: { type: "string" },
+              },
+              required: ["url"],
+            },
+            strict: false,
+            defer_loading: true,
+          },
+        ],
+      },
+      {
+        type: "namespace",
+        name: "chrome-devtools_click",
+        description: "Click an element",
+        tools: [
+          {
+            type: "function",
+            name: "chrome-devtools_click",
+            description: "Click an element",
+            parameters: {
+              type: "object",
+              properties: {
+                uid: { type: "string" },
+              },
+              required: ["uid"],
+            },
+            strict: false,
+            defer_loading: true,
+          },
+        ],
+      },
+      {
+        type: "function",
+        name: "Read",
+        description: "Read a file",
+        parameters: {
+          type: "object",
+          properties: {
+            file_path: { type: "string" },
+          },
+          required: ["file_path"],
+        },
+        strict: false,
+      },
+    ])
+  })
+
+  it("keeps deferred candidates as normal functions when the bridge tool is absent", () => {
+    const result = translateAnthropicMessagesToResponsesPayload({
+      model: "gpt-5.4",
+      max_tokens: 1024,
+      messages: [{ role: "user", content: "fetch a page" }],
+      tools: [
+        {
+          name: "mcp__fetch__fetch",
+          description: "Fetch a URL",
+          input_schema: {
+            type: "object",
+            properties: {
+              url: { type: "string" },
+            },
+          },
+        },
+        {
+          name: "chrome-devtools_click",
+          description: "Click an element",
+          input_schema: {
+            type: "object",
+            properties: {
+              uid: { type: "string" },
+            },
+          },
+        },
+      ],
+    })
+
+    expect(result.parallel_tool_calls).toBe(true)
+    expect(result.tools).toEqual([
+      {
+        type: "function",
+        name: "mcp__fetch__fetch",
+        description: "Fetch a URL",
+        parameters: {
+          type: "object",
+          properties: {
+            url: { type: "string" },
+          },
+        },
+        strict: false,
+      },
+      {
+        type: "function",
+        name: "chrome-devtools_click",
+        description: "Click an element",
+        parameters: {
+          type: "object",
+          properties: {
+            uid: { type: "string" },
+          },
+        },
+        strict: false,
+      },
+    ])
+  })
+
+  it("maps bridge tool_use history into tool_search_call input items", () => {
+    const result = translateAnthropicMessagesToResponsesPayload({
+      model: "gpt-5.4",
+      max_tokens: 1024,
+      messages: [
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "call_search",
+              name: "mcp__tool_search__search",
+              input: { names: "mcp__fetch__fetch" },
+            },
+          ],
+        },
+      ],
+      tools: [
+        {
+          name: "mcp__tool_search__search",
+          input_schema: { type: "object" },
+        },
+        {
+          name: "mcp__fetch__fetch",
+          input_schema: { type: "object" },
+        },
+      ],
+    })
+
+    const input = result.input as Array<ResponseToolSearchCallItem>
+    expect(input).toEqual([
+      {
+        type: "tool_search_call",
+        call_id: "call_search",
+        arguments: { names: ["mcp__fetch__fetch"] },
+        execution: "client",
+        status: "completed",
+      },
+    ])
+  })
+
+  it("preserves namespace on deferred tool_use history", () => {
+    const result = translateAnthropicMessagesToResponsesPayload({
+      model: "gpt-5.4",
+      max_tokens: 1024,
+      messages: [
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "call_shipping_eta",
+              name: "get_shipping_eta",
+              input: { order_id: "order_42" },
+            },
+          ],
+        },
+      ],
+      tools: [
+        {
+          name: "mcp__tool_search__search",
+          input_schema: { type: "object" },
+        },
+        {
+          name: "get_shipping_eta",
+          input_schema: { type: "object" },
+        },
+      ],
+    })
+
+    expect(result.input).toEqual([
+      {
+        type: "function_call",
+        call_id: "call_shipping_eta",
+        name: "get_shipping_eta",
+        namespace: "get_shipping_eta",
+        arguments: '{"order_id":"order_42"}',
+        status: "completed",
+      },
+    ])
+  })
+
+  it("accepts tool_search bridge aliases in tool_use history", () => {
+    const result = translateAnthropicMessagesToResponsesPayload({
+      model: "gpt-5.4",
+      max_tokens: 1024,
+      messages: [
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "call_search",
+              name: "tool_search_search",
+              input: { names: "mcp__fetch__fetch" },
+            },
+          ],
+        },
+      ],
+      tools: [
+        {
+          name: "tool_search_search",
+          input_schema: { type: "object" },
+        },
+        {
+          name: "mcp__fetch__fetch",
+          input_schema: { type: "object" },
+        },
+      ],
+    })
+
+    const input = result.input as Array<ResponseToolSearchCallItem>
+    expect(input).toEqual([
+      {
+        type: "tool_search_call",
+        call_id: "call_search",
+        arguments: { names: ["mcp__fetch__fetch"] },
+        execution: "client",
+        status: "completed",
+      },
+    ])
+  })
+
+  it("rebuilds tool_search_output from tool_reference history", () => {
+    const result = translateAnthropicMessagesToResponsesPayload({
+      model: "gpt-5.4",
+      max_tokens: 1024,
+      messages: [
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "call_search",
+              name: "mcp__tool_search__search",
+              input: { names: "mcp__fetch__fetch" },
+            },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "call_search",
+              content: [
+                {
+                  type: "tool_reference",
+                  tool_name: "mcp__fetch__fetch",
+                },
+              ],
+            },
+          ],
+        },
+      ],
+      tools: [
+        {
+          name: "mcp__tool_search__search",
+          input_schema: { type: "object" },
+        },
+        {
+          name: "mcp__fetch__fetch",
+          description: "Fetch a URL",
+          input_schema: {
+            type: "object",
+            properties: {
+              url: { type: "string" },
+            },
+          },
+        },
+      ],
+    })
+
+    const input = result.input as Array<
+      ResponseToolSearchCallItem | ResponseToolSearchOutputItem
+    >
+    expect(input[1]).toEqual({
+      type: "tool_search_output",
+      call_id: "call_search",
+      execution: "client",
+      tools: [
+        {
+          type: "namespace",
+          name: "mcp__fetch__fetch",
+          description: "Fetch a URL",
+          tools: [
+            {
+              type: "function",
+              name: "mcp__fetch__fetch",
+              description: "Fetch a URL",
+              parameters: {
+                type: "object",
+                properties: {
+                  url: { type: "string" },
+                },
+              },
+              strict: false,
+              defer_loading: true,
+            },
+          ],
+        },
+      ],
+      status: "completed",
+    })
+  })
+
+  it("rebuilds tool_search_output from bridge sentinel results", () => {
+    const result = translateAnthropicMessagesToResponsesPayload({
+      model: "gpt-5.4",
+      max_tokens: 1024,
+      messages: [
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "call_search",
+              name: "mcp__tool_search__search",
+              input: { names: "TaskList" },
+            },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "call_search",
+              content: createMcpToolSearchSentinel("TaskList"),
+            },
+          ],
+        },
+      ],
+      tools: [
+        {
+          name: "mcp__tool_search__search",
+          input_schema: { type: "object" },
+        },
+        {
+          name: "mcp__fetch__fetch",
+          description: "Fetch a URL",
+          input_schema: { type: "object" },
+        },
+        {
+          name: "TaskList",
+          description: "List tasks",
+          input_schema: { type: "object" },
+        },
+      ],
+    })
+
+    const input = result.input as Array<
+      ResponseToolSearchCallItem | ResponseToolSearchOutputItem
+    >
+    const output = input[1] as ResponseToolSearchOutputItem
+    expect(output.type).toBe("tool_search_output")
+    expect(output.execution).toBe("client")
+    expect(
+      (output.tools as Array<{ name: string }>).map((tool) => tool.name),
+    ).toEqual(["TaskList"])
+  })
 })
 
 describe("translateResponsesResultToAnthropic", () => {
@@ -196,7 +878,13 @@ describe("translateResponsesResultToAnthropic", () => {
         {
           id: "reason_1",
           type: "reasoning",
-          summary: [{ type: "summary_text", text: "Thinking about the task." }],
+          summary: [
+            {
+              type: "summary_text",
+              text: "**Thinking about the task**\n\nReviewing the request.",
+            },
+            { type: "summary_text", text: "**Preparing the tool call**" },
+          ],
           status: "completed",
           encrypted_content: "encrypted_reasoning_content",
         },
@@ -251,7 +939,11 @@ describe("translateResponsesResultToAnthropic", () => {
 
     expect(thinkingBlock.type).toBe("thinking")
     if (thinkingBlock.type === "thinking") {
-      expect(thinkingBlock.thinking).toContain("Thinking about the task")
+      expect(thinkingBlock.thinking).toBe(
+        "**Thinking about the task**\n\nReviewing the request."
+          + REASONING_SUMMARY_SEPARATOR
+          + "**Preparing the tool call**",
+      )
     }
 
     expect(toolUseBlock.type).toBe("tool_use")
@@ -272,5 +964,97 @@ describe("translateResponsesResultToAnthropic", () => {
     if (textBlock.type === "text") {
       expect(textBlock.text).toBe("Added the task to your todo list.")
     }
+  })
+
+  it("uses function_call namespace as the Anthropic tool_use name", () => {
+    const responsesResult: ResponsesResult = {
+      id: "resp_namespace",
+      object: "response",
+      created_at: 0,
+      model: "gpt-5.4",
+      output: [
+        {
+          id: "call_1",
+          type: "function_call",
+          call_id: "call_1",
+          name: "invoke",
+          namespace: "mcp__fetch__fetch",
+          arguments: '{"url":"https://example.com"}',
+          status: "completed",
+        },
+      ],
+      output_text: "",
+      status: "completed",
+      usage: null,
+      error: null,
+      incomplete_details: null,
+      instructions: null,
+      metadata: null,
+      parallel_tool_calls: false,
+      temperature: null,
+      tool_choice: null,
+      tools: [],
+      top_p: null,
+    }
+
+    const anthropicResponse =
+      translateResponsesResultToAnthropic(responsesResult)
+
+    expect(anthropicResponse.stop_reason).toBe("tool_use")
+    expect(anthropicResponse.content).toEqual([
+      {
+        type: "tool_use",
+        id: "call_1",
+        name: "mcp__fetch__fetch",
+        input: {
+          url: "https://example.com",
+        },
+      },
+    ])
+  })
+
+  it("maps tool_search_call output into the bridge Anthropic tool_use", () => {
+    const responsesResult: ResponsesResult = {
+      id: "resp_search",
+      object: "response",
+      created_at: 0,
+      model: "gpt-5.4",
+      output: [
+        {
+          id: "search_1",
+          type: "tool_search_call",
+          call_id: "call_search",
+          arguments: { names: ["mcp__fetch__fetch", "TaskList"] },
+          status: "completed",
+        },
+      ],
+      output_text: "",
+      status: "completed",
+      usage: null,
+      error: null,
+      incomplete_details: null,
+      instructions: null,
+      metadata: null,
+      parallel_tool_calls: false,
+      temperature: null,
+      tool_choice: null,
+      tools: [],
+      top_p: null,
+    }
+
+    const anthropicResponse =
+      translateResponsesResultToAnthropic(responsesResult)
+
+    expect(anthropicResponse.stop_reason).toBe("tool_use")
+    expect(anthropicResponse.content).toEqual([
+      {
+        type: "tool_use",
+        id: "call_search",
+        name: "mcp__tool_search__search",
+        input: {
+          names: "mcp__fetch__fetch,TaskList",
+        },
+      },
+    ])
   })
 })
