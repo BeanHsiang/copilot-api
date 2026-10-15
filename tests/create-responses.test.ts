@@ -168,6 +168,45 @@ describe("createResponses", () => {
     expect(response).toEqual(createResponsesResult("gpt-test"))
   })
 
+  test("keeps cache-relevant HTTP payloads deterministic", async () => {
+    const payload: ResponsesPayload = {
+      input: [
+        { role: "user", content: "hello" },
+        {
+          encrypted_content: "encrypted-reasoning",
+          id: "reasoning-1",
+          summary: [],
+          type: "reasoning",
+        },
+      ],
+      instructions: "stable instructions",
+      model: "gpt-test",
+      prompt_cache_key: "stable-cache-key",
+      stream: false,
+    }
+
+    await createResponses(structuredClone(payload), {
+      initiator: "user",
+      requestId: "request-1",
+      vision: false,
+    })
+    await createResponses(structuredClone(payload), {
+      initiator: "user",
+      requestId: "request-1",
+      vision: false,
+    })
+
+    expect(fetchMock.mock.calls[0]?.[1]?.body).toBe(
+      fetchMock.mock.calls[1]?.[1]?.body,
+    )
+    expect(fetchMock.mock.calls[0]?.[1]?.body).toContain(
+      '"prompt_cache_key":"stable-cache-key"',
+    )
+    expect(fetchMock.mock.calls[0]?.[1]?.body).toContain(
+      '"encrypted_content":"encrypted-reasoning"',
+    )
+  })
+
   test("builds the first websocket frame as response.create", () => {
     const payload = {
       background: true,
@@ -213,13 +252,13 @@ describe("createResponses", () => {
       "Copilot-Integration-Id": "vscode-chat",
       "Copilot-Vision-Request": "true",
       "Editor-Device-Id": "device-1",
-      "Editor-Plugin-Version": "copilot-chat/0.58.0",
+      "Editor-Plugin-Version": "copilot-chat/0.68.0",
       "Editor-Version": "vscode/1.120.0",
       "OpenAI-Intent": "conversation-agent",
       "VScode-SessionId": "session-1",
       "VScode-MachineId": "machine-1",
       "X-Agent-Task-Id": "request-1",
-      "X-GitHub-Api-Version": "2026-06-01",
+      "X-GitHub-Api-Version": "2026-08-01",
       "X-Interaction-Id": "interaction-1",
       "X-Interaction-Type": "conversation-agent",
       "X-Request-Id": "request-1",

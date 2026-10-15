@@ -10,15 +10,21 @@ import {
   resolveMappedModel,
 } from "~/lib/config"
 import { createHandlerLogger, debugJson } from "~/lib/logger"
+import { fromClaudeDiscoveryModelId } from "~/lib/claude-models"
 import { findEndpointModel } from "~/lib/models"
-import { parseProviderModelAlias } from "~/lib/provider-model"
+import { resolveConfiguredProviderModelAlias } from "~/lib/provider-resolver"
 import { state } from "~/lib/state"
+import type { SubagentMarker } from "~/lib/subagent"
+import type { TokenUsageEndpoint } from "~/lib/token-usage"
 import {
   generateRequestIdFromPayload,
   getRootSessionId,
   getUUID,
 } from "~/lib/utils"
-import { handleProviderMessagesForProvider } from "~/routes/provider/messages/handler"
+import {
+  handleProviderMessagesForProvider,
+  providerMessagesHandlerDependencies,
+} from "~/routes/provider/messages/handler"
 import { getResponsesTransportForModel } from "~/routes/responses/utils"
 
 import type { AnthropicMessagesPayload } from "~/lib/types/anthropic"
@@ -28,6 +34,8 @@ import {
   handleWithResponsesApi,
 } from "./api-flows"
 import {
+  appendClaudeContinuationMessage,
+  applyClaudeNoToolsEffort,
   applyLastMessageCacheControl,
   getCompactType,
   getLastMessageContentCacheControl,
@@ -51,39 +59,74 @@ export const messagesFlowHandlers = {
 
 export async function handleCompletion(c: Context) {
   const anthropicPayload = await c.req.json<AnthropicMessagesPayload>()
+  anthropicPayload.model = fromClaudeDiscoveryModelId(anthropicPayload.model)
+  applyClaudeNoToolsEffort(anthropicPayload, c.req.header("user-agent"))
 
+  return await handleCompletionPayload(c, anthropicPayload)
+}
+
+export interface CompletionPayloadOptions {
+  compactType?: ReturnType<typeof getCompactType>
+  skipClaudeAutoModel?: boolean
+  skipModelMapping?: boolean
+  skipWebSearch?: boolean
+  usageEndpoint?: TokenUsageEndpoint
+  subagentMarker?: SubagentMarker | null
+  sessionId?: string
+  requestId?: string
+}
+
+export async function handleCompletionPayload(
+  c: Context,
+  anthropicPayload: AnthropicMessagesPayload,
+  dispatchOptions: CompletionPayloadOptions = {},
+) {
   const requestedModel = anthropicPayload.model
-  anthropicPayload.model = resolveMappedModel(anthropicPayload.model)
+  if (!dispatchOptions.skipModelMapping) {
+    anthropicPayload.model = resolveMappedModel(anthropicPayload.model)
+  }
   if (anthropicPayload.model !== requestedModel) {
     consola.debug(
       `Resolved model mapping: ${requestedModel} -> ${anthropicPayload.model}`,
     )
   }
 
-  const webSearchResult = await tryHandleWebSearch(c, anthropicPayload, {
-    logger,
-    forwardToProvider: (ctx, payload, provider) =>
-      handleProviderMessagesForProvider(ctx, { payload, provider }),
-  })
-  if (webSearchResult) return webSearchResult
-
-  const claudeAutoModel = getClaudeAutoModel()
-  const shouldUseClaudeAutoModel = Boolean(
-    claudeAutoModel && isClaudeAutoModelRequest(anthropicPayload),
-  )
-  if (claudeAutoModel && shouldUseClaudeAutoModel) {
-    consola.debug(
-      `Claude auto model override: ${anthropicPayload.model} -> ${claudeAutoModel}`,
-    )
-    anthropicPayload.model = claudeAutoModel
+  if (!dispatchOptions.skipWebSearch) {
+    const webSearchResult = await tryHandleWebSearch(c, anthropicPayload, {
+      logger,
+      forwardToProvider: (ctx, payload, provider) =>
+        handleProviderMessagesForProvider(ctx, { payload, provider }),
+    })
+    if (webSearchResult) return webSearchResult
   }
 
-  const providerModelAlias = parseProviderModelAlias(anthropicPayload.model)
+  const claudeAutoModel = getClaudeAutoModel(true)
+  const shouldUseClaudeAutoModel = Boolean(
+    !dispatchOptions.skipClaudeAutoModel
+      && claudeAutoModel
+      && isClaudeAutoModelRequest(anthropicPayload),
+  )
+  if (claudeAutoModel && shouldUseClaudeAutoModel) {
+    const resolvedClaudeAutoModel =
+      dispatchOptions.skipModelMapping ? claudeAutoModel : (
+        resolveMappedModel(claudeAutoModel)
+      )
+    consola.debug(
+      `Claude auto model override: ${anthropicPayload.model} -> ${resolvedClaudeAutoModel}`,
+    )
+    anthropicPayload.model = resolvedClaudeAutoModel
+  }
+
+  const providerModelAlias = await resolveConfiguredProviderModelAlias(
+    anthropicPayload.model,
+    providerMessagesHandlerDependencies.resolveProviderConfig,
+  )
   if (providerModelAlias) {
     anthropicPayload.model = providerModelAlias.model
     return await handleProviderMessagesForProvider(c, {
       payload: anthropicPayload,
       provider: providerModelAlias.provider,
+      usageEndpoint: dispatchOptions.usageEndpoint,
     })
   }
 
@@ -93,15 +136,19 @@ export async function handleCompletion(c: Context) {
 
   sanitizeIdeTools(anthropicPayload)
 
-  const subagentMarker = parseSubagentMarkerFromFirstUser(anthropicPayload)
+  const subagentMarker =
+    dispatchOptions.subagentMarker
+    ?? parseSubagentMarkerFromFirstUser(anthropicPayload)
   if (subagentMarker) {
     debugJson(logger, "Detected Subagent marker:", subagentMarker)
   }
 
-  let sessionId = getRootSessionId(anthropicPayload, c)
+  let sessionId =
+    dispatchOptions.sessionId ?? getRootSessionId(anthropicPayload, c)
 
   // claude code and opencode compact / auto-continue detection
-  const compactType = getCompactType(anthropicPayload)
+  const compactType =
+    dispatchOptions.compactType ?? getCompactType(anthropicPayload)
 
   // fix claude code 2.0.28+ warmup request consume premium request, forcing small model if no tools are used
   // set "CLAUDE_CODE_SUBAGENT_MODEL": "you small model" also can avoid this
@@ -111,7 +158,11 @@ export async function handleCompletion(c: Context) {
     const tools = anthropicPayload.tools
     const noTools = !tools || tools.length === 0
     if (anthropicBeta && noTools && compactType === 0) {
-      anthropicPayload.model = getSmallModel()
+      const smallModel = getSmallModel()
+      consola.debug(
+        `Claude Code warmup small model: ${anthropicPayload.model} -> ${smallModel}`,
+      )
+      anthropicPayload.model = smallModel
     }
   }
 
@@ -138,7 +189,9 @@ export async function handleCompletion(c: Context) {
     applyLastMessageCacheControl(anthropicPayload, lastMessageCacheControl)
   }
 
-  const requestId = generateRequestIdFromPayload(anthropicPayload, sessionId)
+  const requestId =
+    dispatchOptions.requestId
+    ?? generateRequestIdFromPayload(anthropicPayload, sessionId)
   logger.debug("Generated request ID:", requestId)
 
   if (!sessionId) {
@@ -148,6 +201,7 @@ export async function handleCompletion(c: Context) {
 
   const selectedModel = findEndpointModel(anthropicPayload.model)
   anthropicPayload.model = selectedModel?.id ?? anthropicPayload.model
+  appendClaudeContinuationMessage(anthropicPayload)
 
   if (shouldUseMessagesApi(selectedModel)) {
     return await messagesFlowHandlers.handleWithMessagesApi(
@@ -161,6 +215,7 @@ export async function handleCompletion(c: Context) {
         sessionId,
         compactType,
         logger,
+        usageEndpoint: dispatchOptions.usageEndpoint,
       },
     )
   }
@@ -176,6 +231,7 @@ export async function handleCompletion(c: Context) {
         sessionId,
         compactType,
         logger,
+        usageEndpoint: dispatchOptions.usageEndpoint,
       },
     )
   }
@@ -190,6 +246,7 @@ export async function handleCompletion(c: Context) {
       sessionId,
       compactType,
       logger,
+      usageEndpoint: dispatchOptions.usageEndpoint,
     },
   )
 }

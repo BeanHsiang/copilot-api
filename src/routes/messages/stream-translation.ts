@@ -9,7 +9,6 @@ import {
   type AnthropicStreamEventData,
   type AnthropicStreamState,
 } from "~/lib/types/anthropic"
-import { THINKING_TEXT } from "./non-stream-translation"
 import { mapOpenAIStopReasonToAnthropic } from "./utils"
 
 function isToolBlockOpen(state: AnthropicStreamState): boolean {
@@ -80,6 +79,7 @@ function completePendingMessage(
     type: "message_stop",
   })
   state.pendingMessageDelta = undefined
+  state.messageCompleted = true
 }
 
 function handleFinish(
@@ -243,7 +243,7 @@ function handleContent(
   if (delta.content && delta.content.length > 0) {
     closeThinkingBlockIfOpen(state, events)
 
-    if (isToolBlockOpen(state) || hasToolCallDelta(delta)) {
+    if (isToolBlockOpen(state)) {
       state.deferredContent = `${state.deferredContent ?? ""}${delta.content}`
       return
     }
@@ -294,10 +294,6 @@ function handleContent(
     state.contentBlockIndex++
     state.thinkingBlockOpen = false
   }
-}
-
-function hasToolCallDelta(delta: Delta): boolean {
-  return Boolean(delta.tool_calls && delta.tool_calls.length > 0)
 }
 
 function flushDeferredContent(
@@ -396,7 +392,7 @@ function handleReasoningOpaque(
         index: state.contentBlockIndex,
         delta: {
           type: "thinking_delta",
-          thinking: THINKING_TEXT, // Compatible with opencode, it will filter out blocks where the thinking text is empty, so we add a default thinking text here
+          thinking: "",
         },
       },
       {
@@ -421,7 +417,8 @@ function handleThinkingText(
   state: AnthropicStreamState,
   events: Array<AnthropicStreamEventData>,
 ) {
-  const reasoningText = delta.reasoning_text ?? delta.reasoning_content
+  const reasoningText =
+    delta.reasoning_text ?? delta.reasoning_content ?? delta.reasoning
   if (reasoningText && reasoningText.length > 0) {
     // compatible with copilot API returning content->reasoning_text->reasoning_opaque in different deltas
     // this is an extremely abnormal situation, probably a server-side bug
@@ -430,6 +427,7 @@ function handleThinkingText(
       delta.content = reasoningText
       delta.reasoning_text = undefined
       delta.reasoning_content = undefined
+      delta.reasoning = undefined
       return
     }
 
@@ -485,7 +483,8 @@ export function translateErrorToAnthropicErrorEvent(): AnthropicStreamEventData 
     type: "error",
     error: {
       type: "api_error",
-      message: "An unexpected error occurred during streaming.",
+      message:
+        "An unexpected error occurred during streaming, retry your request.",
     },
   }
 }

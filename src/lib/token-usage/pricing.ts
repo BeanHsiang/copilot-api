@@ -1,8 +1,17 @@
+import { builtinProviderModelRegistry } from "../builtin-provider-models"
+import { getModelsDevModelPricing } from "../models-dev-cache"
+import {
+  resolveProviderModelsDevId,
+  usesModelsDevModelCatalog,
+} from "../provider-model-catalog"
+import type { TokenUsagePeakWindow } from "./peak-windows"
 import {
   normalizeToken,
   type TokenUsageSource,
   type UsageTokens,
 } from "./store"
+
+export type { TokenUsagePeakWindow } from "./peak-windows"
 
 export interface TokenUsagePricingTier {
   cachedInput?: number
@@ -14,6 +23,10 @@ export interface TokenUsagePricingTier {
 }
 
 export interface TokenUsagePricingConfig extends TokenUsagePricingTier {
+  // Prices billed outside every UTC peak window, for providers that discount
+  // off-peak traffic. Ignored unless `peakWindows` is non-empty.
+  offPeak?: TokenUsagePricingTier
+  peakWindows?: Array<TokenUsagePeakWindow>
   tiers?: Array<TokenUsagePricingTier>
 }
 
@@ -23,7 +36,11 @@ export interface CalculatedTokenUsageCost {
   total_cost_nanos: number
 }
 
-interface TokenUsageCostInput extends UsageTokens {
+export interface TokenUsageCostInput extends UsageTokens {
+  serviceTier?: string | null
+  // Timestamp used to pick peak or off-peak prices; defaults to the current
+  // time when omitted.
+  at?: Date | null
   model: string
   pricing?: TokenUsagePricingConfig | null
   pricingCurrency?: string | null
@@ -34,6 +51,7 @@ interface TokenUsageCostInput extends UsageTokens {
 interface ResolvedPricing {
   pricing: TokenUsagePricingConfig
   source: string
+  currency?: string
 }
 
 const COST_NANOS_PER_UNIT = 1_000_000_000
@@ -47,337 +65,6 @@ const BUILTIN_PROVIDER_CURRENCIES: Record<string, string> = {
   deepseek: "CNY",
   kimi: "USD",
   "opencode-go": "USD",
-}
-
-const BUILTIN_PROVIDER_PRICING: Record<
-  string,
-  Record<string, TokenUsagePricingConfig>
-> = {
-  codex: {
-    "gpt-5.3-codex": {
-      cachedInput: 0.175,
-      input: 1.75,
-      output: 14,
-    },
-    "gpt-5.4": {
-      tiers: [
-        {
-          cachedInput: 0.25,
-          input: 2.5,
-          maxInputTokens: 272_000,
-          output: 15,
-        },
-        {
-          cachedInput: 0.5,
-          input: 5,
-          output: 22.5,
-        },
-      ],
-    },
-    "gpt-5.4-mini": {
-      tiers: [
-        {
-          cachedInput: 0.075,
-          input: 0.75,
-          maxInputTokens: 272_000,
-          output: 4.5,
-        },
-        {
-          cachedInput: 0.15,
-          input: 1.5,
-          output: 6.75,
-        },
-      ],
-    },
-    "gpt-5.5": {
-      tiers: [
-        {
-          cachedInput: 0.5,
-          input: 5,
-          maxInputTokens: 272_000,
-          output: 30,
-        },
-        {
-          cachedInput: 1,
-          input: 10,
-          output: 45,
-        },
-      ],
-    },
-    "gpt-5.6-sol": {
-      tiers: [
-        {
-          cacheCreationInput: 6.25,
-          cachedInput: 0.5,
-          input: 5,
-          maxInputTokens: 272_000,
-          output: 30,
-        },
-        {
-          cacheCreationInput: 12.5,
-          cachedInput: 1,
-          input: 10,
-          output: 45,
-        },
-      ],
-    },
-    "gpt-5.6-terra": {
-      tiers: [
-        {
-          cacheCreationInput: 2.5,
-          cachedInput: 0.2,
-          input: 2,
-          maxInputTokens: 272_000,
-          output: 12,
-        },
-        {
-          cacheCreationInput: 5,
-          cachedInput: 0.4,
-          input: 4,
-          output: 18,
-        },
-      ],
-    },
-    "gpt-5.6-luna": {
-      tiers: [
-        {
-          cacheCreationInput: 0.25,
-          cachedInput: 0.02,
-          input: 0.2,
-          maxInputTokens: 272_000,
-          output: 1.2,
-        },
-        {
-          cacheCreationInput: 0.5,
-          cachedInput: 0.04,
-          input: 0.4,
-          output: 1.8,
-        },
-      ],
-    },
-  },
-  dashscope: {
-    "glm-5.1": {
-      tiers: [
-        {
-          cachedInput: 1.2,
-          cacheCreationInput: 7.5,
-          explicitCachedInput: 0.6,
-          input: 6,
-          maxInputTokens: 32_000,
-          output: 24,
-        },
-        {
-          cachedInput: 1.6,
-          cacheCreationInput: 10,
-          explicitCachedInput: 0.8,
-          input: 8,
-          maxInputTokens: 200_000,
-          output: 28,
-        },
-      ],
-    },
-    "glm-5.2": {
-      cachedInput: 2,
-      cacheCreationInput: 10,
-      explicitCachedInput: 0.8,
-      input: 8,
-      output: 28,
-    },
-    "qwen3.7-max": {
-      cachedInput: 2.4,
-      cacheCreationInput: 15,
-      explicitCachedInput: 1.2,
-      input: 12,
-      output: 36,
-    },
-    "qwen3.8-max": {
-      cachedInput: 1.5,
-      cacheCreationInput: 15,
-      explicitCachedInput: 1,
-      input: 12,
-      output: 36,
-    },
-    "deepseek-v4-flash-0731": {
-      cachedInput: 0.2,
-      input: 1,
-      output: 2,
-    },
-    "qwen3.7-plus": {
-      tiers: [
-        {
-          cachedInput: 0.4,
-          cacheCreationInput: 2.5,
-          explicitCachedInput: 0.2,
-          input: 2,
-          maxInputTokens: 256_000,
-          output: 8,
-        },
-        {
-          cachedInput: 1.2,
-          cacheCreationInput: 7.5,
-          explicitCachedInput: 0.6,
-          input: 6,
-          maxInputTokens: 1_000_000,
-          output: 24,
-        },
-      ],
-    },
-    "kimi/kimi-k3": {
-      cachedInput: 2,
-      input: 20,
-      output: 100,
-    },
-  },
-  deepseek: {
-    "deepseek-v4-flash": {
-      cachedInput: 0.02,
-      input: 1,
-      output: 2,
-    },
-    "deepseek-v4-pro": {
-      cachedInput: 0.025,
-      input: 3,
-      output: 6,
-    },
-  },
-  "opencode-go": {
-    hy3: {
-      cachedInput: 0.035,
-      input: 0.14,
-      output: 0.58,
-    },
-    "gpt-5.6-luna": {
-      tiers: [
-        {
-          cacheCreationInput: 0.125,
-          cachedInput: 0.01,
-          input: 0.1,
-          maxInputTokens: 272_000,
-          output: 0.6,
-        },
-        {
-          cacheCreationInput: 0.25,
-          cachedInput: 0.02,
-          input: 0.2,
-          output: 0.9,
-        },
-      ],
-    },
-    "glm-5.2": {
-      cachedInput: 0.26,
-      input: 1.4,
-      output: 4.4,
-    },
-    "grok-4.5": {
-      tiers: [
-        {
-          cachedInput: 0.5,
-          input: 2,
-          maxInputTokens: 200_000,
-          output: 6,
-        },
-        {
-          cachedInput: 1,
-          input: 4,
-          output: 12,
-        },
-      ],
-    },
-    "deepseek-v4-flash": {
-      cachedInput: 0.0028,
-      input: 0.14,
-      output: 0.28,
-    },
-    "deepseek-v4-pro": {
-      cachedInput: 0.0145,
-      input: 1.74,
-      output: 3.48,
-    },
-    "kimi-k2.7-code": {
-      cachedInput: 0.19,
-      input: 0.95,
-      output: 4,
-    },
-    "kimi-k3": {
-      cachedInput: 0.3,
-      input: 3,
-      output: 15,
-    },
-    "mimo-v2.5": {
-      cachedInput: 0.0028,
-      input: 0.14,
-      output: 0.28,
-    },
-    "mimo-v2.5-pro": {
-      cachedInput: 0.0145,
-      input: 1.74,
-      output: 3.48,
-    },
-    "qwen3.7-plus": {
-      tiers: [
-        {
-          cacheCreationInput: 0.5,
-          cachedInput: 0.04,
-          input: 0.4,
-          maxInputTokens: 200_000,
-          output: 1.6,
-        },
-        {
-          cacheCreationInput: 1.5,
-          cachedInput: 0.12,
-          input: 1.2,
-          maxInputTokens: 256_000,
-          output: 4.8,
-        },
-      ],
-    },
-    "qwen3.7-max": {
-      cacheCreationInput: 3.125,
-      cachedInput: 0.5,
-      input: 2.5,
-      output: 7.5,
-    },
-    "qwen3.8-max": {
-      cacheCreationInput: 2.5,
-      cachedInput: 0.25,
-      input: 2,
-      output: 6,
-    },
-    "minimax-m2.7": {
-      cachedInput: 0.06,
-      input: 0.3,
-      output: 1.2,
-    },
-    "minimax-m3": {
-      tiers: [
-        {
-          cachedInput: 0.06,
-          input: 0.3,
-          maxInputTokens: 200_000,
-          output: 1.2,
-        },
-        {
-          cachedInput: 0.12,
-          input: 0.6,
-          maxInputTokens: 512_000,
-          output: 2.4,
-        },
-      ],
-    },
-  },
-  kimi: {
-    k3: {
-      cachedInput: 0.3,
-      input: 3,
-      output: 15,
-    },
-    "k3-256k": {
-      cachedInput: 0.3,
-      input: 3,
-      output: 15,
-    },
-  },
 }
 
 export function resolveTokenUsageCost(
@@ -414,8 +101,11 @@ export function resolveTokenUsageCost(
   const pricing = resolvePricingTier(
     resolvedPricing.pricing,
     getInputTokenTotal(input),
+    resolvePricingTime(input.at),
   )
-  const currency = resolveProviderCurrency(providerName, input.pricingCurrency)
+  const currency =
+    resolvedPricing.currency
+    ?? resolveProviderCurrency(providerName, input.pricingCurrency)
   if (!currency) {
     return null
   }
@@ -425,11 +115,14 @@ export function resolveTokenUsageCost(
   const cacheReadPrice = resolveCacheReadPrice(pricing, input)
   const cacheCreationPrice = resolveCacheCreationPrice(pricing)
 
-  const totalCostNanos =
+  const baseCostNanos =
     costNanosForTokens(input.input_tokens, inputPrice)
     + costNanosForTokens(input.output_tokens, outputPrice)
     + costNanosForTokens(input.cache_read_input_tokens, cacheReadPrice)
     + costNanosForTokens(input.cache_creation_input_tokens, cacheCreationPrice)
+  const totalCostNanos = Math.round(
+    baseCostNanos * resolveCodexServiceTierMultiplier(input, providerName),
+  )
 
   if (totalCostNanos <= 0) {
     return null
@@ -439,6 +132,27 @@ export function resolveTokenUsageCost(
     currency,
     source: resolvedPricing.source,
     total_cost_nanos: totalCostNanos,
+  }
+}
+
+function resolveCodexServiceTierMultiplier(
+  input: TokenUsageCostInput,
+  providerName: string,
+): number {
+  if (providerName.toLowerCase() !== "codex") {
+    return 1
+  }
+
+  // Price-estimate multipliers, applied after selecting the context rates.
+  // https://developers.openai.com/api/docs/pricing
+  switch (input.serviceTier?.trim().toLowerCase()) {
+    case "priority":
+    case "fast":
+      return 2
+    case "ultrafast":
+      return 6
+    default:
+      return 1
   }
 }
 
@@ -500,8 +214,25 @@ function resolveProviderPricing(
     }
   }
 
-  const builtinPricing =
-    BUILTIN_PROVIDER_PRICING[providerName.toLowerCase()]?.[model.toLowerCase()]
+  if (usesModelsDevModelCatalog(providerName)) {
+    const pricing = getModelsDevModelPricing(
+      resolveProviderModelsDevId(providerName),
+      model,
+    )
+    if (pricing) return { pricing, source: "models.dev", currency: "USD" }
+  }
+
+  const pricingModel =
+    (
+      providerName.toLowerCase() === "codex"
+      && model.trim().toLowerCase() === "gpt-5.6"
+    ) ?
+      "gpt-5.6-sol"
+    : model
+  const builtinPricing = builtinProviderModelRegistry.getModelConfig(
+    providerName,
+    pricingModel,
+  )?.pricing
   if (!builtinPricing) {
     return null
   }
@@ -515,6 +246,7 @@ function resolveProviderPricing(
 function resolvePricingTier(
   pricing: TokenUsagePricingConfig,
   inputTokenTotal: number,
+  at: Date,
 ): TokenUsagePricingTier {
   const tiers = pricing.tiers
     ?.filter((tier) => typeof tier === "object" && tier !== null)
@@ -524,10 +256,61 @@ function resolvePricingTier(
     tiers?.find((tier) => inputTokenTotal <= normalizeTierMax(tier))
     ?? tiers?.at(-1)
 
-  return {
+  const resolvedTier = {
     ...pricing,
     ...selectedTier,
   }
+
+  const offPeak = pricing.offPeak
+  const peakWindows = pricing.peakWindows
+  if (offPeak && peakWindows?.length && !isPeakPricingTime(peakWindows, at)) {
+    return { ...resolvedTier, ...offPeak }
+  }
+
+  return resolvedTier
+}
+
+function resolvePricingTime(at: Date | null | undefined): Date {
+  return at instanceof Date && Number.isFinite(at.getTime()) ? at : new Date()
+}
+
+// Peak windows are matched against UTC minutes and ISO weekdays so a catalog
+// entry bills the same no matter which timezone the host runs in.
+export function isPeakPricingTime(
+  windows: Array<TokenUsagePeakWindow>,
+  at: Date,
+): boolean {
+  const minuteOfDay = at.getUTCHours() * 60 + at.getUTCMinutes()
+  const isoWeekday = at.getUTCDay() || 7
+
+  return windows.some((window) => {
+    const startMinute = normalizeMinuteOfDay(window.startMinuteUtc)
+    const endMinute = normalizeMinuteOfDay(window.endMinuteUtc)
+    if (
+      startMinute === null
+      || endMinute === null
+      || endMinute <= startMinute
+    ) {
+      return false
+    }
+
+    if (window.weekdays?.length && !window.weekdays.includes(isoWeekday)) {
+      return false
+    }
+
+    return minuteOfDay >= startMinute && minuteOfDay < endMinute
+  })
+}
+
+function normalizeMinuteOfDay(value: number | undefined): number | null {
+  return (
+      typeof value === "number"
+        && Number.isFinite(value)
+        && value >= 0
+        && value <= 1_440
+    ) ?
+      value
+    : null
 }
 
 function normalizeTierMax(tier: TokenUsagePricingTier): number {
@@ -555,7 +338,7 @@ function normalizePrice(value: number | null | undefined): number | null {
     : null
 }
 
-function resolveProviderCurrency(
+export function resolveProviderCurrency(
   providerName: string,
   configuredCurrency: string | null | undefined,
 ): string | null {

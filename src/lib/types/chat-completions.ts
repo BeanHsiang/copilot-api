@@ -24,7 +24,7 @@ export interface ChatCompletionChunk {
       accepted_prediction_tokens: number
       rejected_prediction_tokens: number
     }
-  }
+  } | null
 }
 
 export interface Delta {
@@ -42,6 +42,7 @@ export interface Delta {
   reasoning_text?: string | null
   reasoning_content?: string | null
   reasoning_opaque?: string | null
+  reasoning?: string | null
 }
 
 export interface Choice {
@@ -84,6 +85,7 @@ interface ResponseMessage {
   reasoning_text?: string | null
   reasoning_content?: string | null
   reasoning_opaque?: string | null
+  reasoning?: string | null
   tool_calls?: Array<ToolCall>
 }
 
@@ -128,6 +130,7 @@ export interface ChatCompletionsPayload {
   } | null
   thinking_budget?: number
   reasoning_effort?: string
+  prompt_cache_key?: string | null
   top_k?: number | null
   parallel_tool_calls?: boolean | null
 }
@@ -138,6 +141,7 @@ export interface Tool {
     name: string
     description?: string
     parameters: Record<string, unknown>
+    strict?: boolean
   }
 }
 
@@ -151,6 +155,7 @@ export interface Message {
   reasoning_content?: string | null
   reasoning_text?: string | null
   reasoning_opaque?: string | null
+  reasoning?: string | null
   copilot_cache_control?: CopilotCacheControl
 }
 

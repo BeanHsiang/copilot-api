@@ -16,6 +16,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.18.0"
+
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
@@ -26,13 +30,13 @@ jobs:
       - name: Build server
         run: bun run build
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22.13.0"
-
       - name: Install desktop dependencies
         working-directory: desktop
         run: bun install --frozen-lockfile
+
+      - name: Typecheck desktop
+        working-directory: desktop
+        run: bun run typecheck
 
       - name: Build macOS arm64 package
         working-directory: desktop
@@ -53,6 +57,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.18.0"
+
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
@@ -63,13 +71,13 @@ jobs:
       - name: Build server
         run: bun run build
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22.13.0"
-
       - name: Install desktop dependencies
         working-directory: desktop
         run: bun install --frozen-lockfile
+
+      - name: Typecheck desktop
+        working-directory: desktop
+        run: bun run typecheck
 
       - name: Build Windows package
         working-directory: desktop
@@ -77,13 +85,22 @@ jobs:
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: false
 
+      - name: Verify Windows update metadata
+        working-directory: desktop
+        run: |
+          if (!(Test-Path -LiteralPath 'release/latest.yml')) {
+            throw 'Windows update metadata was not generated'
+          }
+
       - uses: actions/upload-artifact@v4
         with:
           name: win
           path: |
             desktop/release/*.exe
             desktop/release/*.msi
-          if-no-files-found: warn
+            desktop/release/*.blockmap
+            desktop/release/latest.yml
+          if-no-files-found: error
 
   # ─── Linux (x64) ────────────────────────────────────────────────────────
   build-linux-x64:
@@ -92,6 +109,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.18.0"
+
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
@@ -102,22 +123,28 @@ jobs:
       - name: Build server
         run: bun run build
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22.13.0"
-
       - name: Install desktop dependencies
         working-directory: desktop
         run: bun install --frozen-lockfile
+
+      - name: Typecheck desktop
+        working-directory: desktop
+        run: bun run typecheck
 
       - name: Build Linux x64 package
         working-directory: desktop
         run: bun run package:linux -- --x64
 
+      - name: Verify Linux update metadata
+        working-directory: desktop
+        run: test -f release/latest-linux.yml
+
       - uses: actions/upload-artifact@v4
         with:
           name: linux-x64
-          path: desktop/release/*.AppImage
+          path: |
+            desktop/release/*.AppImage
+            desktop/release/latest-linux.yml
           if-no-files-found: error
 
   # ─── Upload all artifacts to the GitHub Release ──────────────────────────
@@ -150,8 +177,13 @@ jobs:
 
       - name: Upload artifacts to GitHub Release
         run: |
-          find artifacts -type f -exec \
-            gh release upload "${{ github.ref_name }}" {} --clobber \;
+          # Publish manifests last, once every referenced installer is available.
+          while IFS= read -r -d '' artifact; do
+            gh release upload "${{ github.ref_name }}" "$artifact" --clobber
+          done < <(find artifacts -type f ! -name 'latest*.yml' -print0)
+          while IFS= read -r -d '' manifest; do
+            gh release upload "${{ github.ref_name }}" "$manifest" --clobber
+          done < <(find artifacts -type f -name 'latest*.yml' -print0)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}

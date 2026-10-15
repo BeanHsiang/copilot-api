@@ -10,6 +10,7 @@ import {
   compactTextOnlyGuard,
   type CompactType,
 } from "~/lib/compact"
+import { isClaudeUserAgent } from "~/lib/claude-models"
 import { getReasoningEffortForModel } from "~/lib/config"
 import { normalizeSdkModelId } from "~/lib/models"
 
@@ -101,14 +102,18 @@ const normalizeSystemContentForMerge = (
     return normalizeSystemStringForMerge(content)
   }
 
-  return content.map((block) =>
-    block.text.startsWith(SYSTEM_REMINDER_START) ?
-      block
-    : {
-        ...block,
-        text: ensureSystemReminderText(block.text),
-      },
-  )
+  return content.flatMap((block) => {
+    const normalized = normalizeSystemStringForMerge(block.text)
+    if (typeof normalized === "string") {
+      return [{ ...block, text: normalized }]
+    }
+
+    return normalized.map((normalizedBlock, index) =>
+      index === normalized.length - 1 ?
+        { ...block, text: normalizedBlock.text }
+      : normalizedBlock,
+    )
+  })
 }
 
 const toSystemTextBlocks = (
@@ -195,10 +200,19 @@ export const normalizeClaudeCodeBillingHeaderInSystem = (
   )
 }
 
+const supportsMidSystemMessages = (model: string): boolean =>
+  model.startsWith("gpt")
+  || model.startsWith("codex")
+  || model.startsWith("claude")
+
 export const normalizeSystemMessages = (
   payload: AnthropicMessagesPayload,
 ): void => {
   normalizeClaudeCodeBillingHeaderInSystem(payload)
+
+  if (supportsMidSystemMessages(payload.model)) {
+    return
+  }
 
   if (!payload.messages.some((msg) => msg.role === "system")) {
     return
@@ -378,6 +392,20 @@ export const getCompactType = (
   }
 
   return 0
+}
+
+export const applyClaudeNoToolsEffort = (
+  payload: AnthropicMessagesPayload,
+  userAgent: string | undefined,
+): void => {
+  if (!isClaudeUserAgent(userAgent) || (payload.tools?.length ?? 0) > 0) {
+    return
+  }
+
+  payload.output_config = {
+    ...payload.output_config,
+    effort: "low",
+  }
 }
 
 /**
@@ -883,14 +911,33 @@ const filterAssistantThinkingBlocks = (
     if (msg.role === "assistant" && Array.isArray(msg.content)) {
       msg.content = msg.content.filter((block) => {
         if (block.type !== "thinking") return true
+        // Keep signature-only blocks (empty `thinking` text). On the Anthropic
+        // Messages API it is the signature, not the summary text, that carries
+        // reasoning continuity across turns, and Copilot's upstream frequently
+        // returns thinking blocks with an empty summary. Requiring non-empty
+        // text here silently drops those blocks — and their signatures — so the
+        // reasoning chain breaks on exactly those turns. The `"Thinking..."`
+        // placeholder is still excluded: it is a synthetic value this project
+        // adds for clients that filter empty text, never real model output.
         return (
-          block.thinking
-          && block.thinking !== "Thinking..."
+          block.thinking !== "Thinking..."
           && block.signature
           && !block.signature.includes("@")
         )
       })
     }
+  }
+}
+
+export const appendClaudeContinuationMessage = (
+  payload: AnthropicMessagesPayload,
+): void => {
+  const lastMessage = payload.messages.at(-1)
+  if (payload.model.includes("claude") && lastMessage?.role === "assistant") {
+    payload.messages.push({
+      role: "user",
+      content: [{ type: "text", text: "Please continue." }],
+    })
   }
 }
 
@@ -936,6 +983,7 @@ export const prepareMessagesApiPayload = (
         | "max"
     }
     payload.output_config = {
+      ...payload.output_config,
       effort: effort,
     }
   }

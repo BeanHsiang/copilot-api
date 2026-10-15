@@ -4,6 +4,7 @@ import consola from "consola"
 import {
   resolveEffectiveProviderType,
   resolveMappedModel,
+  resolveProviderConfigForModel,
   type ResolvedProviderConfig,
 } from "~/lib/config"
 import { HTTPError } from "~/lib/error"
@@ -131,6 +132,8 @@ export const alphaSearchResponsesDependencies = {
   findEndpointModel,
   now: (): number => Date.now(),
   resolveMappedModel,
+  resolveEffectiveProviderType,
+  resolveProviderConfig,
   createUsageRecorder: (
     model: string,
     sessionId: string,
@@ -616,7 +619,8 @@ async function resolveRemoteModel(
       request.model
     : alphaSearchResponsesDependencies.resolveMappedModel(request.model)
   if (provider) {
-    const providerConfig = await resolveProviderConfig(provider)
+    const providerConfig =
+      await alphaSearchResponsesDependencies.resolveProviderConfig(provider)
     if (!providerConfig) {
       return c.json(
         {
@@ -630,7 +634,10 @@ async function resolveRemoteModel(
     }
 
     if (
-      resolveEffectiveProviderType(providerConfig, model) !== "openai-responses"
+      alphaSearchResponsesDependencies.resolveEffectiveProviderType(
+        providerConfig,
+        model,
+      ) !== "openai-responses"
     ) {
       return invalidRequest(
         c,
@@ -638,7 +645,10 @@ async function resolveRemoteModel(
       )
     }
 
-    return { model, providerConfig }
+    return {
+      model,
+      providerConfig: resolveProviderConfigForModel(providerConfig, model),
+    }
   }
 
   const selectedModel =
@@ -692,6 +702,7 @@ async function requestProviderSearch(
     providerConfig,
     payload,
     c.req.raw.headers,
+    { clientSignal: c.req.raw.signal },
   )
   if (!upstreamResponse.ok) {
     throw new HTTPError(
@@ -721,6 +732,7 @@ async function requestCopilotSearch(
   model: string,
   requestId: string,
   sessionId: string,
+  clientSignal?: AbortSignal,
 ): Promise<ResponsesResult> {
   debugJson(logger, "Alpha search Copilot Responses request:", payload)
   const result = (await alphaSearchResponsesDependencies.createResponses(
@@ -731,6 +743,7 @@ async function requestCopilotSearch(
       transport: "http",
       requestId,
       sessionId,
+      clientSignal,
     },
   )) as ResponsesResult
   debugJson(logger, "Alpha search Copilot Responses result:", result)
@@ -778,7 +791,13 @@ async function requestRemoteSearch(
     )
   }
 
-  return await requestCopilotSearch(payload, target.model, requestId, sessionId)
+  return await requestCopilotSearch(
+    payload,
+    target.model,
+    requestId,
+    sessionId,
+    c.req.raw.signal,
+  )
 }
 
 function getActiveRemoteReferences(

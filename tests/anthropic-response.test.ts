@@ -290,6 +290,7 @@ describe("OpenAI to Anthropic Streaming Response Translation", () => {
 
     const streamState: AnthropicStreamState = {
       messageStartSent: false,
+      messageCompleted: false,
       contentBlockIndex: 0,
       contentBlockOpen: false,
       toolCalls: {},
@@ -391,6 +392,7 @@ describe("OpenAI to Anthropic Streaming Response Translation", () => {
     // Streaming translation requires state
     const streamState: AnthropicStreamState = {
       messageStartSent: false,
+      messageCompleted: false,
       contentBlockIndex: 0,
       contentBlockOpen: false,
       toolCalls: {},
@@ -408,6 +410,131 @@ describe("OpenAI to Anthropic Streaming Response Translation", () => {
 })
 
 describe("OpenAI stream interleaved tool/content translation", () => {
+  test("emits text before a tool call when both start in the same chunk", () => {
+    const streamState: AnthropicStreamState = {
+      messageStartSent: false,
+      messageCompleted: false,
+      contentBlockIndex: 0,
+      contentBlockOpen: false,
+      toolCalls: {},
+      thinkingBlockOpen: false,
+    }
+    const chunks: Array<ChatCompletionChunk> = [
+      {
+        id: "chatcmpl-be6d5639-41fd-44c4-9a16-d8c4ce48ded9",
+        object: "chat.completion.chunk",
+        created: 1790258959,
+        model: "deepseek-v4.1-flash",
+        choices: [
+          {
+            index: 0,
+            delta: {
+              content: "）**",
+              tool_calls: [
+                {
+                  id: "call_1f4a0f06a6d4487da8350d28",
+                  type: "function",
+                  index: 0,
+                  function: { name: "read", arguments: "" },
+                },
+              ],
+              reasoning_content: "",
+            },
+            logprobs: null,
+            finish_reason: null,
+          },
+        ],
+        usage: null,
+      },
+      {
+        id: "chatcmpl-be6d5639-41fd-44c4-9a16-d8c4ce48ded9",
+        object: "chat.completion.chunk",
+        created: 1790258959,
+        model: "deepseek-v4.1-flash",
+        choices: [
+          {
+            index: 0,
+            delta: {
+              tool_calls: [{ index: 0, function: { arguments: "{}" } }],
+            },
+            logprobs: null,
+            finish_reason: null,
+          },
+        ],
+        usage: null,
+      },
+      {
+        id: "chatcmpl-be6d5639-41fd-44c4-9a16-d8c4ce48ded9",
+        object: "chat.completion.chunk",
+        created: 1790258959,
+        model: "deepseek-v4.1-flash",
+        choices: [
+          {
+            index: 0,
+            delta: {},
+            logprobs: null,
+            finish_reason: "tool_calls",
+          },
+        ],
+        usage: null,
+      },
+    ]
+
+    const translatedStream = chunks.flatMap((chunk) =>
+      translateChunkToAnthropicEvents(chunk, streamState),
+    )
+    translatedStream.push(...flushPendingAnthropicStreamEvents(streamState))
+
+    expect(translatedStream).toEqual([
+      {
+        type: "message_start",
+        message: {
+          id: "chatcmpl-be6d5639-41fd-44c4-9a16-d8c4ce48ded9",
+          type: "message",
+          role: "assistant",
+          content: [],
+          model: "deepseek-v4.1-flash",
+          stop_reason: null,
+          stop_sequence: null,
+          usage: { input_tokens: 0, output_tokens: 0 },
+        },
+      },
+      {
+        type: "content_block_start",
+        index: 0,
+        content_block: { type: "text", text: "" },
+      },
+      {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "text_delta", text: "）**" },
+      },
+      { type: "content_block_stop", index: 0 },
+      {
+        type: "content_block_start",
+        index: 1,
+        content_block: {
+          type: "tool_use",
+          id: "call_1f4a0f06a6d4487da8350d28",
+          name: "read",
+          input: {},
+        },
+      },
+      {
+        type: "content_block_delta",
+        index: 1,
+        delta: { type: "input_json_delta", partial_json: "{}" },
+      },
+      { type: "content_block_stop", index: 1 },
+      {
+        type: "message_delta",
+        delta: { stop_reason: "tool_use", stop_sequence: null },
+        usage: { input_tokens: 0, output_tokens: 0 },
+      },
+      { type: "message_stop" },
+    ])
+  })
+
   test("should defer content while a tool call is still streaming", () => {
     const openAIStream: Array<ChatCompletionChunk> = [
       {
@@ -508,6 +635,7 @@ describe("OpenAI stream interleaved tool/content translation", () => {
 
     const streamState: AnthropicStreamState = {
       messageStartSent: false,
+      messageCompleted: false,
       contentBlockIndex: 0,
       contentBlockOpen: false,
       toolCalls: {},
@@ -608,6 +736,7 @@ describe("OpenAI usage-only stream translation", () => {
 
     const streamState: AnthropicStreamState = {
       messageStartSent: false,
+      messageCompleted: false,
       contentBlockIndex: 0,
       contentBlockOpen: false,
       toolCalls: {},
@@ -702,6 +831,7 @@ describe("OpenAI usage-only stream translation", () => {
 
     const streamState: AnthropicStreamState = {
       messageStartSent: false,
+      messageCompleted: false,
       contentBlockIndex: 0,
       contentBlockOpen: false,
       toolCalls: {},
@@ -776,6 +906,7 @@ describe("OpenAI usage-only stream translation", () => {
 
     const streamState: AnthropicStreamState = {
       messageStartSent: false,
+      messageCompleted: false,
       contentBlockIndex: 0,
       contentBlockOpen: false,
       toolCalls: {},
@@ -802,5 +933,95 @@ describe("OpenAI usage-only stream translation", () => {
       },
     })
     expect(translatedStream.at(-1)).toEqual({ type: "message_stop" })
+  })
+
+  test("should mark the stream completed after finish_reason and flush", () => {
+    const openAIStream: Array<ChatCompletionChunk> = [
+      {
+        id: "cmpl-complete",
+        object: "chat.completion.chunk",
+        created: 1677652288,
+        model: "kimi-k3",
+        choices: [
+          {
+            index: 0,
+            delta: { content: "hi" },
+            finish_reason: null,
+            logprobs: null,
+          },
+        ],
+      },
+      {
+        id: "cmpl-complete",
+        object: "chat.completion.chunk",
+        created: 1677652288,
+        model: "kimi-k3",
+        choices: [
+          { index: 0, delta: {}, finish_reason: "stop", logprobs: null },
+        ],
+        usage: {
+          prompt_tokens: 3,
+          completion_tokens: 1,
+          total_tokens: 4,
+        },
+      },
+    ]
+
+    const streamState: AnthropicStreamState = {
+      messageStartSent: false,
+      messageCompleted: false,
+      contentBlockIndex: 0,
+      contentBlockOpen: false,
+      toolCalls: {},
+      thinkingBlockOpen: false,
+    }
+    const translatedStream = openAIStream.flatMap((chunk) =>
+      translateChunkToAnthropicEvents(chunk, streamState),
+    )
+    translatedStream.push(...flushPendingAnthropicStreamEvents(streamState))
+
+    expect(streamState.messageCompleted).toBe(true)
+    expect(translatedStream.at(-1)).toEqual({ type: "message_stop" })
+  })
+
+  test("should keep the stream incomplete when interrupted during thinking output", () => {
+    const openAIStream: Array<ChatCompletionChunk> = [
+      {
+        id: "cmpl-thinking-cut",
+        object: "chat.completion.chunk",
+        created: 1677652288,
+        model: "kimi-k3",
+        choices: [
+          {
+            index: 0,
+            delta: { reasoning_text: "partial thought" },
+            finish_reason: null,
+            logprobs: null,
+          },
+        ],
+      },
+      // The stream ends here: no finish_reason and no usage chunk arrive.
+    ]
+
+    const streamState: AnthropicStreamState = {
+      messageStartSent: false,
+      messageCompleted: false,
+      contentBlockIndex: 0,
+      contentBlockOpen: false,
+      toolCalls: {},
+      thinkingBlockOpen: false,
+    }
+    const translatedStream = openAIStream.flatMap((chunk) =>
+      translateChunkToAnthropicEvents(chunk, streamState),
+    )
+    const flushedEvents = flushPendingAnthropicStreamEvents(streamState)
+
+    // The thinking block was opened but the stream never finished.
+    expect(streamState.thinkingBlockOpen).toBe(true)
+    expect(streamState.messageCompleted).toBe(false)
+    expect(flushedEvents).toHaveLength(0)
+    expect(
+      translatedStream.some((event) => event.type === "message_stop"),
+    ).toBe(false)
   })
 })

@@ -7,9 +7,14 @@ import {
   resolveMappedModel,
 } from "~/lib/config"
 import { createHandlerLogger, debugJson, debugJsonTail } from "~/lib/logger"
-import { parseProviderModelAlias } from "~/lib/provider-model"
-import { handleProviderResponsesForProvider } from "~/routes/provider/responses/handler"
-import { state } from "~/lib/state"
+import { findEndpointModel } from "~/lib/models"
+import { resolveConfiguredProviderModelAlias } from "~/lib/provider-resolver"
+import { writeSSEIfConnected } from "~/lib/sse"
+import { isCodexUserAgent } from "~/routes/models/codex-models"
+import {
+  handleProviderResponsesForProvider,
+  providerResponsesHandlerDependencies,
+} from "~/routes/provider/responses/handler"
 import {
   createCopilotTokenUsageRecorder,
   normalizeOptionalToken,
@@ -25,17 +30,25 @@ import type { SubagentMarker } from "~/lib/subagent"
 import type {
   ResponsesPayload,
   ResponsesResult,
+  ResponsesTransport,
   ResponseStreamEvent,
 } from "~/lib/types/responses"
 import { createResponses as createCopilotResponses } from "~/services/copilot/create-responses"
 
+import { handleResponsesViaMessages } from "./messages-handler"
 import { createStreamIdTracker, fixStreamIds } from "./stream-id-sync"
+import { getCodexTaskTitleModel } from "./task-title"
 import {
   applyResponsesApiContextManagement,
   compactInputByLatestCompaction,
+  filterReasoningForTransport,
   getResponsesTransportForModel,
   getResponsesRequestOptions,
+  normalizeGuardianAgentMessages,
+  normalizeInputImageDetails,
+  normalizeResponsesReasoningEffort,
   sanitizeOversizedInputImages,
+  sanitizeUnsupportedInputFields,
 } from "./utils"
 import consola from "consola"
 
@@ -43,27 +56,41 @@ const logger = createHandlerLogger("responses-handler")
 
 export const responsesHandlerDependencies = {
   createResponses: createCopilotResponses,
+  findEndpointModel,
   isResponsesApiWebSearchEnabled: isConfiguredResponsesApiWebSearchEnabled,
+  resolveMappedModel,
 }
 
 export const handleResponses = async (c: Context) => {
   const payload = await c.req.json<ResponsesPayload>()
   const requestedModel = payload.model
-  payload.model = resolveMappedModel(payload.model)
+  payload.model = responsesHandlerDependencies.resolveMappedModel(payload.model)
   if (payload.model !== requestedModel) {
     consola.debug(
       `Resolved model mapping: ${requestedModel} -> ${payload.model}`,
     )
   }
 
-  const providerModelAlias = parseProviderModelAlias(payload.model)
+  const providerModelAlias = await resolveConfiguredProviderModelAlias(
+    payload.model,
+    providerResponsesHandlerDependencies.resolveProviderConfig,
+  )
   if (providerModelAlias) {
     payload.model = providerModelAlias.model
     return await handleProviderResponsesForProvider(c, {
       payload,
       provider: providerModelAlias.provider,
+      publicModel: requestedModel,
     })
   }
+
+  const taskTitleModel = getCodexTaskTitleModel(
+    c.req.header("user-agent"),
+    payload.input,
+    "copilot",
+  )
+  if (taskTitleModel) payload.model = taskTitleModel
+  const publicModel = taskTitleModel ?? requestedModel
 
   debugJson(logger, "Responses request payload:", payload)
 
@@ -74,30 +101,48 @@ export const handleResponses = async (c: Context) => {
 
   const incomingSessionId = getIncomingResponsesSessionId(c)
   const sessionId = incomingSessionId ? getUUID(incomingSessionId) : undefined
-  const requestId = generateRequestIdFromPayload(
-    { messages: payload.input },
-    sessionId,
-  )
+  const threadId =
+    c.req.header("thread-id") ?? c.req.header("x-opencode-session-id")
+  const requestId =
+    threadId ?
+      getUUID(threadId + "_")
+    : generateRequestIdFromPayload({ messages: payload.input }, sessionId)
   logger.debug("Generated request ID:", requestId)
 
   const fallbackSessionId = sessionId ?? getUUID(requestId)
   logger.debug("Extracted session ID:", fallbackSessionId)
-  const recordUsage = createCopilotTokenUsageRecorder({
-    endpoint: "responses",
-    fallbackSessionId,
-    model: payload.model,
-  })
-
-  removeUnsupportedTools(payload)
-
-  if (!responsesHandlerDependencies.isResponsesApiWebSearchEnabled()) {
-    removeWebSearchTool(payload)
-  }
-
-  const selectedModel = state.models?.data.find(
-    (model) => model.id === payload.model,
+  const selectedModel = responsesHandlerDependencies.findEndpointModel(
+    payload.model,
   )
+  payload.model = selectedModel?.id ?? payload.model
+  const normalizedReasoningEffort = normalizeResponsesReasoningEffort(
+    payload,
+    selectedModel?.capabilities?.supports?.reasoning_effort,
+  )
+  if (normalizedReasoningEffort) {
+    logger.debug(
+      `Normalized reasoning effort from ${normalizedReasoningEffort.from} to ${normalizedReasoningEffort.to} based on the selected model capabilities`,
+    )
+  }
   const responsesTransport = getResponsesTransportForModel(selectedModel)
+
+  const useMessagesFallback = shouldFallbackToMessages(
+    c,
+    payload.model,
+    selectedModel,
+    responsesTransport,
+  )
+  if (useMessagesFallback) {
+    filterReasoningForTransport(payload, true)
+    return await handleResponsesViaMessages(c, {
+      payload,
+      publicModel,
+      targetModel: payload.model,
+      subagentMarker,
+      requestId,
+      sessionId: fallbackSessionId,
+    })
+  }
 
   if (!responsesTransport) {
     return c.json(
@@ -110,6 +155,42 @@ export const handleResponses = async (c: Context) => {
       },
       400,
     )
+  }
+
+  filterReasoningForTransport(payload, false)
+
+  const recordUsage = createCopilotTokenUsageRecorder({
+    endpoint: "responses",
+    fallbackSessionId,
+    model: payload.model,
+  })
+
+  const normalizedAgentMessageCount = normalizeGuardianAgentMessages(payload)
+  if (normalizedAgentMessageCount > 0) {
+    logger.debug(
+      `Translated ${normalizedAgentMessageCount} Guardian agent message(s) to user messages before forwarding to Copilot Responses`,
+    )
+  }
+
+  const sanitizedUnsupportedFieldCount = sanitizeUnsupportedInputFields(payload)
+  if (sanitizedUnsupportedFieldCount > 0) {
+    logger.debug(
+      `Removed ${sanitizedUnsupportedFieldCount} unsupported input field(s) before forwarding to Copilot Responses`,
+    )
+  }
+
+  const normalizedImageDetailCount = normalizeInputImageDetails(payload)
+  if (normalizedImageDetailCount > 0) {
+    logger.debug(
+      `Normalized ${normalizedImageDetailCount} unsupported input image detail value(s) before forwarding to Copilot Responses`,
+    )
+  }
+
+  removeUnsupportedTools(payload)
+  fillEmptyNamespaceToolDescriptions(payload)
+
+  if (!responsesHandlerDependencies.isResponsesApiWebSearchEnabled()) {
+    removeWebSearchTool(payload)
   }
 
   const sanitizedImageCount = sanitizeOversizedInputImages(
@@ -148,6 +229,7 @@ export const handleResponses = async (c: Context) => {
     subagentMarker,
     requestId,
     sessionId: fallbackSessionId,
+    clientSignal: c.req.raw.signal,
     transport: responsesTransport,
   })
 
@@ -156,37 +238,43 @@ export const handleResponses = async (c: Context) => {
     return streamSSE(c, async (stream) => {
       const idTracker = createStreamIdTracker()
       let usage: UsageTokens = {}
+      const iterator = response[Symbol.asyncIterator]()
 
-      for await (const chunk of response) {
-        debugJson(logger, "Responses stream chunk:", chunk)
-        const parsedEvent = parseResponsesStreamEvent(chunk)
-        if (
-          parsedEvent?.type === "response.completed"
-          || parsedEvent?.type === "response.failed"
-          || parsedEvent?.type === "response.incomplete"
-        ) {
-          usage = {
-            ...normalizeResponsesUsage(parsedEvent.response.usage),
-            total_nano_aiu: normalizeOptionalToken(
-              parsedEvent.copilot_usage?.total_nano_aiu,
-            ),
+      try {
+        for await (const chunk of {
+          [Symbol.asyncIterator]: () => iterator,
+        }) {
+          debugJson(logger, "Responses stream chunk:", chunk)
+          const parsedEvent = parseResponsesStreamEvent(chunk)
+          if (
+            parsedEvent?.type === "response.completed"
+            || parsedEvent?.type === "response.failed"
+            || parsedEvent?.type === "response.incomplete"
+          ) {
+            usage = {
+              ...normalizeResponsesUsage(parsedEvent.response.usage),
+              total_nano_aiu: normalizeOptionalToken(
+                parsedEvent.copilot_usage?.total_nano_aiu,
+              ),
+            }
           }
+
+          const processedData = fixStreamIds(
+            (chunk as { data?: string }).data ?? "",
+            (chunk as { event?: string }).event,
+            idTracker,
+          )
+
+          await writeSSEIfConnected(stream, {
+            id: (chunk as { id?: string }).id,
+            event: (chunk as { event?: string }).event,
+            data: processedData,
+          })
         }
-
-        const processedData = fixStreamIds(
-          (chunk as { data?: string }).data ?? "",
-          (chunk as { event?: string }).event,
-          idTracker,
-        )
-
-        await stream.writeSSE({
-          id: (chunk as { id?: string }).id,
-          event: (chunk as { event?: string }).event,
-          data: processedData,
-        })
+      } finally {
+        await iterator.return?.()
+        recordUsage(usage)
       }
-
-      recordUsage(usage)
     })
   }
 
@@ -206,6 +294,27 @@ export const handleResponses = async (c: Context) => {
 
 const isStreamingRequested = (payload: ResponsesPayload): boolean =>
   Boolean(payload.stream)
+
+const shouldFallbackToMessages = (
+  c: Context,
+  modelId: string,
+  selectedModel: { supported_endpoints?: Array<string> } | undefined,
+  responsesTransport: ResponsesTransport | null,
+): boolean => {
+  if (isCodexUserAgent(c.req.header("user-agent"))) {
+    return !(modelId.startsWith("gpt") || modelId.startsWith("codex"))
+  }
+
+  if (responsesTransport) {
+    return false
+  }
+
+  const supportedEndpoints = selectedModel?.supported_endpoints ?? []
+  return (
+    supportedEndpoints.includes("/v1/messages")
+    || supportedEndpoints.includes("/chat/completions")
+  )
+}
 
 const parseResponsesStreamEvent = (
   chunk: unknown,
@@ -255,8 +364,40 @@ export const removeUnsupportedTools = (payload: ResponsesPayload): void => {
   }
 }
 
+export const fillEmptyNamespaceToolDescriptions = (
+  payload: ResponsesPayload,
+): void => {
+  fillEmptyNamespaceDescriptions(payload.tools)
+
+  if (!Array.isArray(payload.input)) return
+
+  for (const item of payload.input) {
+    if (!item || typeof item !== "object") continue
+    fillEmptyNamespaceDescriptions((item as Record<string, unknown>).tools)
+  }
+}
+
+const fillEmptyNamespaceDescriptions = (tools: unknown): void => {
+  if (!Array.isArray(tools)) return
+
+  for (const tool of tools) {
+    if (!tool || typeof tool !== "object") continue
+
+    const namespaceTool = tool as Record<string, unknown>
+    if (
+      namespaceTool.type === "namespace"
+      && namespaceTool.description === ""
+      && typeof namespaceTool.name === "string"
+    ) {
+      namespaceTool.description = namespaceTool.name
+    }
+  }
+}
+
 const getIncomingResponsesSessionId = (c: Context): string | undefined =>
-  getTrimmedHeader(c, "session-id") ?? getTrimmedHeader(c, "x-session-id")
+  getTrimmedHeader(c, "session-id")
+  ?? getTrimmedHeader(c, "x-root-session-id")
+  ?? getTrimmedHeader(c, "x-session-id")
 
 const codexSubagentHeaderValues = new Set([
   "collab_spawn",

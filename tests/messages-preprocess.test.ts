@@ -36,9 +36,47 @@ afterEach(() => {
 })
 
 describe("normalizeSystemMessages", () => {
+  test.each(["gpt-5.4", "codex-mini-latest", "claude-opus-4.6"])(
+    "preserves mid system messages for %s models",
+    (model) => {
+      const payload: AnthropicMessagesPayload = {
+        model,
+        max_tokens: 128,
+        system:
+          "x-anthropic-billing-header: cc_version=2.1.158.c0c; cc_entrypoint=cli; cch=6fb32;",
+        messages: [
+          {
+            role: "user",
+            content: "hello",
+          },
+          {
+            role: "system",
+            content: "follow the repo style",
+          },
+        ],
+      }
+
+      normalizeSystemMessages(payload)
+
+      expect(payload.messages).toEqual([
+        {
+          role: "user",
+          content: "hello",
+        },
+        {
+          role: "system",
+          content: "follow the repo style",
+        },
+      ])
+      expect(payload.system).toBe(
+        "x-anthropic-billing-header: cc_version=2.1.158.c0c; cc_entrypoint=cli; cch=<stable>;",
+      )
+    },
+  )
+
   test("merges system string content into the previous message", () => {
     const payload: AnthropicMessagesPayload = {
-      model: "claude-opus-4.6",
+      model: "gemini-2.5-pro",
       max_tokens: 128,
       messages: [
         {
@@ -74,7 +112,7 @@ describe("normalizeSystemMessages", () => {
 
   test("moves leading system messages to payload.system and appends block content to the previous array message", () => {
     const payload: AnthropicMessagesPayload = {
-      model: "claude-opus-4.6",
+      model: "gemini-2.5-pro",
       max_tokens: 128,
       messages: [
         {
@@ -126,7 +164,7 @@ describe("normalizeSystemMessages", () => {
 
   test("inserts system text after tool_result blocks in user array content", () => {
     const payload: AnthropicMessagesPayload = {
-      model: "claude-opus-4.6",
+      model: "gemini-2.5-pro",
       max_tokens: 128,
       messages: [
         {
@@ -176,7 +214,7 @@ describe("normalizeSystemMessages", () => {
 
   test("splits SubagentStart hook additional first line into its own content block", () => {
     const payload: AnthropicMessagesPayload = {
-      model: "claude-opus-4.6",
+      model: "gemini-2.5-pro",
       max_tokens: 128,
       messages: [
         {
@@ -203,6 +241,56 @@ describe("normalizeSystemMessages", () => {
           {
             type: "text",
             text: "<system-reminder>\nextra reminder\n</system-reminder>",
+          },
+          {
+            type: "text",
+            text: "hello",
+          },
+        ],
+      },
+    ])
+  })
+
+  test("splits SubagentStart hook additional array block and preserves its cache boundary", () => {
+    const payload: AnthropicMessagesPayload = {
+      model: "gemini-2.5-pro",
+      max_tokens: 128,
+      messages: [
+        {
+          role: "user",
+          content: "hello",
+        },
+        {
+          role: "system",
+          content: [
+            {
+              type: "text",
+              text: 'SubagentStart hook additional context: __SUBAGENT_MARKER__{"session_id":"sub-session","agent_id":"agent-1","agent_type":"Explore"}\n\nThe following skills are available',
+              cache_control: {
+                type: "ephemeral",
+              },
+            },
+          ],
+        },
+      ],
+    }
+
+    normalizeSystemMessages(payload)
+
+    expect(payload.messages).toEqual([
+      {
+        role: "user",
+        content: [
+          {
+            type: "text",
+            text: '<system-reminder>\nSubagentStart hook additional context: __SUBAGENT_MARKER__{"session_id":"sub-session","agent_id":"agent-1","agent_type":"Explore"}\n</system-reminder>',
+          },
+          {
+            type: "text",
+            text: "<system-reminder>\nThe following skills are available\n</system-reminder>",
+            cache_control: {
+              type: "ephemeral",
+            },
           },
           {
             type: "text",
@@ -655,77 +743,6 @@ describe("mergeToolResultForClaude attachments", () => {
       ],
     })
   })
-
-  test("appends image and document blocks to the last tool_result", () => {
-    const payload: AnthropicMessagesPayload = {
-      model: "claude-opus-4.6",
-      max_tokens: 128,
-      messages: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "tool_result",
-              tool_use_id: "tool-1",
-              content: "binary output",
-            },
-            {
-              type: "image",
-              source: {
-                type: "base64",
-                media_type: "image/png",
-                data: "image-data",
-              },
-            },
-            {
-              type: "document",
-              source: {
-                type: "base64",
-                media_type: "application/pdf",
-                data: "pdf-data",
-              },
-              title: "report.pdf",
-            },
-          ],
-        },
-      ],
-    }
-
-    mergeToolResultForClaude(payload)
-
-    expect(payload.messages[0]).toEqual({
-      role: "user",
-      content: [
-        {
-          type: "tool_result",
-          tool_use_id: "tool-1",
-          content: [
-            {
-              type: "text",
-              text: "binary output",
-            },
-            {
-              type: "image",
-              source: {
-                type: "base64",
-                media_type: "image/png",
-                data: "image-data",
-              },
-            },
-            {
-              type: "document",
-              source: {
-                type: "base64",
-                media_type: "application/pdf",
-                data: "pdf-data",
-              },
-              title: "report.pdf",
-            },
-          ],
-        },
-      ],
-    })
-  })
 })
 
 describe("mergeToolResultForClaude attachments fallback", () => {
@@ -1015,42 +1032,34 @@ describe("sanitizeIdeTools", () => {
     )
     expect(executeCodeTool?.description).toBe("Execute code")
   })
-
-  test("rewrites getDiagnostics description for GPT models", () => {
-    const payload: AnthropicMessagesPayload = {
-      model: "gpt-5.4",
-      max_tokens: 128,
-      messages: [{ role: "user", content: "hello" }],
-      tools: [
-        {
-          name: "mcp__ide__executeCode",
-          description: "Execute code",
-          input_schema: { type: "object" },
-        },
-        {
-          name: "mcp__ide__getDiagnostics",
-          description: "Old description",
-          input_schema: { type: "object" },
-        },
-      ],
-    }
-
-    sanitizeIdeTools(payload)
-
-    expect(payload.tools?.map((tool) => tool.name)).toEqual([
-      "mcp__ide__executeCode",
-      "mcp__ide__getDiagnostics",
-    ])
-    const diagnosticsTool = payload.tools?.find(
-      (tool) => tool.name === "mcp__ide__getDiagnostics",
-    )
-    expect(diagnosticsTool?.description).toBe(
-      "Get language diagnostics from VS Code. Returns errors, warnings, information, and hints for files in the workspace.",
-    )
-  })
 })
 
 describe("prepareMessagesApiPayload", () => {
+  test("preserves low effort and output format with adaptive thinking", () => {
+    const outputConfig: AnthropicMessagesPayload["output_config"] = {
+      effort: "low",
+      format: { type: "json_schema", schema: { type: "object" } },
+    }
+    const payload: AnthropicMessagesPayload = {
+      model: "claude-opus-4.8",
+      max_tokens: 128,
+      messages: [{ role: "user", content: "hello" }],
+      output_config: outputConfig,
+    }
+
+    prepareMessagesApiPayload(payload, {
+      capabilities: {
+        supports: {
+          adaptive_thinking: true,
+          reasoning_effort: ["low", "medium", "high", "max"],
+        },
+      },
+    } as never)
+
+    expect(payload.output_config).toEqual(outputConfig)
+    expect(payload.thinking?.type).toBe("adaptive")
+  })
+
   test("strips cache_control scope, filters thinking blocks, and enables adaptive thinking", () => {
     const payload: AnthropicMessagesPayload = {
       model: "gpt-5.4",
@@ -1135,6 +1144,56 @@ describe("prepareMessagesApiPayload", () => {
       display: "summarized",
     })
     expect(payload.output_config).toEqual({ effort: "xhigh" })
+  })
+
+  test("keeps signature-only thinking blocks", () => {
+    const payload: AnthropicMessagesPayload = {
+      model: "claude-opus-5",
+      max_tokens: 128,
+      messages: [
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "thinking",
+              thinking: "",
+              signature: "sig-only",
+            },
+            {
+              type: "text",
+              text: "Visible text",
+            },
+          ],
+        },
+        {
+          role: "user",
+          content: "hello",
+        },
+      ],
+    }
+
+    prepareMessagesApiPayload(payload, {
+      capabilities: {
+        supports: {
+          adaptive_thinking: true,
+        },
+      },
+    } as never)
+
+    expect(payload.messages[0]).toEqual({
+      role: "assistant",
+      content: [
+        {
+          type: "thinking",
+          thinking: "",
+          signature: "sig-only",
+        },
+        {
+          type: "text",
+          text: "Visible text",
+        },
+      ],
+    })
   })
 
   test("sets summarized display for Claude versions at least 4.7", () => {

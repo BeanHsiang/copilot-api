@@ -2,34 +2,50 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test"
 import { Hono } from "hono"
 
 import type { ResolvedProviderConfig } from "~/lib/config"
-import type { ResponsesResult } from "~/lib/types/responses"
+import { installModelsDevCatalog } from "~/lib/models-dev-cache"
+import { state } from "~/lib/state"
+import type { ResponsesPayload, ResponsesResult } from "~/lib/types/responses"
+import { codexResponsesDependencies } from "~/services/codex/create-responses"
 
-const actualConfigModule = await import("~/lib/config")
-const actualTokenUsageModule = await import("~/lib/token-usage")
+import { modelsDevCatalogFixture } from "./fixtures/models-dev-catalog"
 
 let providerConfig: ResolvedProviderConfig | null = null
 
-const noopTokenUsageRecorder = () => {}
-
-await mock.module("~/lib/config", () => ({
-  ...actualConfigModule,
-  getProviderConfig: () => providerConfig,
-  resolveMappedModel: (model: string) => model,
-}))
-
-await mock.module("~/lib/token-usage", () => ({
-  ...actualTokenUsageModule,
-  createProviderTokenUsageRecorder: () => noopTokenUsageRecorder,
-}))
-
+const { closeUsageStore } = await import("~/lib/token-usage")
 const { responsesRoutes } = await import("~/routes/responses/route")
 const { providerResponsesRoutes } = await import(
   "~/routes/provider/responses/route"
 )
+const { providerMessagesHandlerDependencies } = await import(
+  "~/routes/provider/messages/handler"
+)
+const { providerResponsesHandlerDependencies } = await import(
+  "~/routes/provider/responses/handler"
+)
+const { responsesHandlerDependencies } = await import(
+  "~/routes/responses/handler"
+)
+const { responsesMessagesDependencies } = await import(
+  "~/routes/responses/messages-handler"
+)
 const { responsesUtilsDependencies } = await import("~/routes/responses/utils")
+const { taskTitleDependencies } = await import("~/routes/responses/task-title")
 
+const defaultProviderMessagesHandlerDependencies = {
+  ...providerMessagesHandlerDependencies,
+}
+const defaultProviderResponsesHandlerDependencies = {
+  ...providerResponsesHandlerDependencies,
+}
+const defaultResponsesHandlerDependencies = { ...responsesHandlerDependencies }
+const defaultResponsesMessagesDependencies = {
+  ...responsesMessagesDependencies,
+}
 const defaultResponsesUtilsDependencies = { ...responsesUtilsDependencies }
+const defaultTaskTitleDependencies = { ...taskTitleDependencies }
 const originalFetch = globalThis.fetch
+
+const DB_PATH_ENV = "COPILOT_API_SQLITE_DB_PATH"
 
 const createResponsesResult = (model: string): ResponsesResult => ({
   created_at: 0,
@@ -59,7 +75,10 @@ const parseJsonRequestBody = (body: unknown): unknown => {
   return JSON.parse(body) as unknown
 }
 
-const fetchMock = mock((_url: string | URL | Request, init?: RequestInit) => {
+const defaultFetchImplementation = (
+  _url: string | URL | Request,
+  init?: RequestInit,
+) => {
   const body = parseJsonRequestBody(init?.body) as { model: string }
   return Promise.resolve(
     new Response(JSON.stringify(createResponsesResult(body.model)), {
@@ -68,7 +87,9 @@ const fetchMock = mock((_url: string | URL | Request, init?: RequestInit) => {
       },
     }),
   )
-})
+}
+
+const fetchMock = mock(defaultFetchImplementation)
 
 const createApp = () => {
   const app = new Hono()
@@ -77,7 +98,10 @@ const createApp = () => {
   return app
 }
 
-beforeEach(() => {
+beforeEach(async () => {
+  process.env[DB_PATH_ENV] = ":memory:"
+  await closeUsageStore()
+
   providerConfig = {
     apiKey: "provider-key",
     authType: "authorization",
@@ -89,20 +113,327 @@ beforeEach(() => {
     type: "openai-responses",
   }
 
+  const resolveProviderConfig = () => Promise.resolve(providerConfig)
+  providerMessagesHandlerDependencies.resolveProviderConfig =
+    resolveProviderConfig
+  providerResponsesHandlerDependencies.resolveProviderConfig =
+    resolveProviderConfig
+  responsesHandlerDependencies.resolveMappedModel = (model) => model
   responsesUtilsDependencies.getModelResponsesApiCompactThreshold = () =>
     undefined
   responsesUtilsDependencies.isContextManagementEnabledForMessages = () => true
   responsesUtilsDependencies.isContextManagementEnabledForResponses = () =>
     false
+  fetchMock.mockImplementation(defaultFetchImplementation)
   fetchMock.mockClear()
   ;(globalThis as unknown as { fetch: typeof fetch }).fetch =
     fetchMock as unknown as typeof fetch
 })
 
-afterEach(() => {
+afterEach(async () => {
   ;(globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch
   providerConfig = null
+  Object.assign(
+    providerMessagesHandlerDependencies,
+    defaultProviderMessagesHandlerDependencies,
+  )
+  Object.assign(
+    providerResponsesHandlerDependencies,
+    defaultProviderResponsesHandlerDependencies,
+  )
+  Object.assign(
+    responsesHandlerDependencies,
+    defaultResponsesHandlerDependencies,
+  )
+  Object.assign(
+    responsesMessagesDependencies,
+    defaultResponsesMessagesDependencies,
+  )
   Object.assign(responsesUtilsDependencies, defaultResponsesUtilsDependencies)
+  Object.assign(taskTitleDependencies, defaultTaskTitleDependencies)
+
+  await closeUsageStore()
+  Reflect.deleteProperty(process.env, DB_PATH_ENV)
+})
+
+describe("OpenCode provider Responses forwarding", () => {
+  test.each(["codex", "xai"])(
+    "preserves PDF input and reasoning for OpenCode requests to %s",
+    async (provider) => {
+      const model = provider === "codex" ? "gpt-6-luna" : "grok-4.7"
+      const baseUrl = `https://${provider}.example`
+      providerConfig = {
+        apiKey: "provider-key",
+        authType: provider === "codex" ? "oauth2" : "authorization",
+        baseUrl,
+        models: { [model]: { reasoningEfforts: ["high"] } },
+        name: provider,
+        type: "openai-responses",
+      }
+      const originalAccessToken = state.codexAccessToken
+      const originalAccountId = state.codexAccountId
+      state.codexAccessToken = "synthetic-codex-token"
+      state.codexAccountId = "synthetic-account"
+      const payload: ResponsesPayload = {
+        model: `${provider}/${model}`,
+        reasoning: { effort: "high" },
+        input: [
+          {
+            type: "message",
+            role: "user",
+            content: [
+              {
+                type: "input_file",
+                file_data: "data:application/pdf;base64,pdf-data",
+                filename: "report.pdf",
+              },
+            ],
+          },
+        ],
+      }
+
+      try {
+        const response = await createApp().request("/v1/responses", {
+          body: JSON.stringify(payload),
+          headers: {
+            "content-type": "application/json",
+            "user-agent": "opencode/2.0.24",
+          },
+          method: "POST",
+        })
+
+        expect(response.status).toBe(200)
+        expect(fetchMock).toHaveBeenCalledTimes(1)
+        const [url, init] = fetchMock.mock.calls[0]
+        expect(url).toBe(
+          `${baseUrl}/${provider === "codex" ? "codex" : "v1"}/responses`,
+        )
+        const body = parseJsonRequestBody(init?.body) as ResponsesPayload
+        expect(body.model).toBe(model)
+        expect(body.input).toEqual(payload.input)
+        expect(body.reasoning).toEqual({ effort: "high" })
+        expect(body).not.toHaveProperty("output_config")
+      } finally {
+        state.codexAccessToken = originalAccessToken
+        state.codexAccountId = originalAccountId
+      }
+    },
+  )
+
+  test("forwards OpenCode native compaction triggers through the regular Codex Responses endpoint", async () => {
+    const originalAccessToken = state.codexAccessToken
+    const originalAccountId = state.codexAccountId
+    const originalWebSocketEnabled =
+      codexResponsesDependencies.isResponsesApiWebSocketEnabled
+    providerConfig = {
+      apiKey: "provider-key",
+      authType: "oauth2",
+      baseUrl: "https://codex.example",
+      name: "codex",
+      type: "openai-responses",
+    }
+    state.codexAccessToken = "synthetic-codex-token"
+    state.codexAccountId = "synthetic-account"
+    codexResponsesDependencies.isResponsesApiWebSocketEnabled = () => false
+    responsesUtilsDependencies.isContextManagementEnabledForResponses = () =>
+      true
+    const result: ResponsesResult = {
+      ...createResponsesResult("gpt-6-luna"),
+      output: [
+        {
+          id: "cmp-opencode",
+          type: "compaction",
+          encrypted_content: "encrypted-opencode-checkpoint",
+        },
+      ],
+    }
+    fetchMock.mockImplementation(() =>
+      Promise.resolve(
+        new Response(
+          `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: result })}\n\n`,
+          { headers: { "content-type": "text/event-stream" } },
+        ),
+      ),
+    )
+    const payload: ResponsesPayload = {
+      model: "codex/gpt-6-luna",
+      stream: true,
+      input: [
+        {
+          role: "user",
+          content: [{ type: "input_text", text: "Earlier work" }],
+        },
+        { type: "compaction_trigger" },
+      ],
+    }
+
+    try {
+      const response = await createApp().request("/v1/responses", {
+        body: JSON.stringify(payload),
+        headers: {
+          "content-type": "application/json",
+          "user-agent": "opencode/2.0.24",
+        },
+        method: "POST",
+      })
+      expect(response.status).toBe(200)
+      expect(await response.text()).toContain("encrypted-opencode-checkpoint")
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+      const [url, init] = fetchMock.mock.calls[0]
+      expect(url).toBe("https://codex.example/codex/responses")
+      const body = parseJsonRequestBody(init?.body) as ResponsesPayload
+      expect(body.model).toBe("gpt-6-luna")
+      expect(body.input).toEqual(payload.input)
+      expect(body.context_management).toBeUndefined()
+      expect(body.stream).toBe(true)
+    } finally {
+      state.codexAccessToken = originalAccessToken
+      state.codexAccountId = originalAccountId
+      codexResponsesDependencies.isResponsesApiWebSocketEnabled =
+        originalWebSocketEnabled
+    }
+  })
+})
+
+describe("Codex task title model routing on provider Responses", () => {
+  const taskTitlePrompt =
+    "Generate a concise, single-line task title of at most 36 characters and under five words where possible."
+  const titleInput = [
+    { role: "user", content: [{ type: "input_text", text: taskTitlePrompt }] },
+  ]
+
+  beforeEach(() => {
+    taskTitleDependencies.getSmallModelForProvider = (provider) =>
+      provider === "codex" ? "gpt-codex-small"
+      : provider === "copilot" ? "gpt-copilot-small"
+      : provider === "openai" ? "gpt-openai-small"
+      : undefined
+  })
+
+  for (const [name, path, requestedModel, input, userAgent, expectedModel] of [
+    [
+      "Codex provider",
+      "/codex/v1/responses",
+      "gpt-test",
+      titleInput,
+      "codex/1.0",
+      "gpt-codex-small",
+    ],
+    [
+      "Copilot provider",
+      "/copilot/v1/responses",
+      "gpt-test",
+      titleInput,
+      "codex/1.0",
+      "gpt-copilot-small",
+    ],
+    [
+      "configured third-party provider",
+      "/openai/v1/responses",
+      "gpt-test",
+      titleInput,
+      "codex/1.0",
+      "gpt-openai-small",
+    ],
+    [
+      "public provider alias",
+      "/v1/responses",
+      "openai/gpt-test",
+      titleInput,
+      "codex/1.0",
+      "gpt-openai-small",
+    ],
+    [
+      "non-Codex request",
+      "/openai/v1/responses",
+      "gpt-test",
+      titleInput,
+      "other-client/1.0",
+      "gpt-test",
+    ],
+    [
+      "unmatched input",
+      "/openai/v1/responses",
+      "gpt-test",
+      [
+        ...titleInput,
+        { role: "user", content: [{ type: "input_text", text: "Continue" }] },
+        { role: "user", content: [{ type: "input_text", text: "Again" }] },
+      ],
+      "codex/1.0",
+      "gpt-test",
+    ],
+  ] as const) {
+    test(`forwards ${expectedModel} for ${name}`, async () => {
+      const response = await createApp().request(path, {
+        body: JSON.stringify({ model: requestedModel, input }),
+        headers: {
+          "content-type": "application/json",
+          "user-agent": userAgent,
+        },
+        method: "POST",
+      })
+
+      expect(response.status).toBe(200)
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+      const [, init] = fetchMock.mock.calls[0]
+      const body = parseJsonRequestBody((init as RequestInit).body) as {
+        model: string
+      }
+      expect(body.model).toBe(expectedModel)
+    })
+  }
+
+  test("does not reuse another provider's small model", async () => {
+    providerConfig = { ...providerConfig!, name: "dashscope" }
+
+    const response = await createApp().request("/dashscope/v1/responses", {
+      body: JSON.stringify({ model: "gpt-test", input: titleInput }),
+      headers: {
+        "content-type": "application/json",
+        "user-agent": "codex/1.0",
+      },
+      method: "POST",
+    })
+
+    expect(response.status).toBe(200)
+    const [, init] = fetchMock.mock.calls[0]
+    const body = parseJsonRequestBody((init as RequestInit).body) as {
+      model: string
+    }
+    expect(body.model).toBe("gpt-test")
+  })
+
+  test("uses the configured small model as the public model for Messages fallback", async () => {
+    providerConfig = { ...providerConfig!, type: "anthropic" }
+    responsesMessagesDependencies.handleCompletionPayload = mock(() =>
+      Promise.resolve(
+        Response.json({
+          content: [{ type: "text", text: "Title" }],
+          id: "msg-title",
+          model: "gpt-openai-small",
+          role: "assistant",
+          stop_reason: "end_turn",
+          stop_sequence: null,
+          type: "message",
+          usage: { input_tokens: 5, output_tokens: 1 },
+        }),
+      ),
+    )
+
+    const response = await createApp().request("/openai/v1/responses", {
+      body: JSON.stringify({ model: "gpt-test", input: titleInput }),
+      headers: {
+        "content-type": "application/json",
+        "user-agent": "codex/1.0",
+      },
+      method: "POST",
+    })
+
+    expect(response.status).toBe(200)
+    const body = (await response.json()) as ResponsesResult
+    expect(body.model).toBe("gpt-openai-small")
+  })
 })
 
 describe("provider Responses context management", () => {
@@ -204,32 +535,57 @@ describe("provider Responses context management", () => {
     ])
   })
 
-  test("disables context management for gpt-5.6 models even when responses is enabled", async () => {
-    responsesUtilsDependencies.isContextManagementEnabledForResponses = () =>
-      true
+  test.each(["grok-4.5", "gpt-5.6-sol", "gpt-6"])(
+    "preserves history and disables context management for %s even when enabled",
+    async (model) => {
+      responsesUtilsDependencies.isContextManagementEnabledForResponses = () =>
+        true
+      const input = [
+        { content: "older", role: "user" },
+        { encrypted_content: "cipher", id: "compaction-1", type: "compaction" },
+        { content: "latest", role: "user" },
+      ]
+      const response = await createApp().request("/v1/responses", {
+        body: JSON.stringify({ input, model: "openai/" + model }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+
+      expect(response.status).toBe(200)
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+      const [, init] = fetchMock.mock.calls[0]
+      const body = parseJsonRequestBody((init as RequestInit).body) as {
+        context_management?: unknown
+        input: Array<unknown>
+      }
+      expect(body.context_management).toBeUndefined()
+      expect(body.input).toEqual(input)
+    },
+  )
+
+  test("normalizes Grok effort across the Codex Messages fallback", async () => {
+    installModelsDevCatalog(modelsDevCatalogFixture)
+    providerConfig = {
+      apiKey: "provider-key",
+      authType: "authorization",
+      baseUrl: "https://openai-responses.example",
+      models: {
+        "grok-4.7": {},
+      },
+      name: "opencode-go",
+      type: "openai-responses",
+    }
 
     const app = createApp()
-    const response = await app.request("/v1/responses", {
+    const response = await app.request("/opencode-go/v1/responses", {
       body: JSON.stringify({
-        input: [
-          {
-            content: "older",
-            role: "user",
-          },
-          {
-            encrypted_content: "cipher",
-            id: "compaction-1",
-            type: "compaction",
-          },
-          {
-            content: "latest",
-            role: "user",
-          },
-        ],
-        model: "openai/gpt-5.6-sol",
+        input: "hello",
+        model: "grok-4.7",
+        reasoning: { effort: "max" },
       }),
       headers: {
         "content-type": "application/json",
+        "user-agent": "codex-cli/1.0.0",
       },
       method: "POST",
     })
@@ -239,56 +595,36 @@ describe("provider Responses context management", () => {
 
     const [, init] = fetchMock.mock.calls[0]
     const body = parseJsonRequestBody((init as RequestInit).body) as {
-      context_management?: unknown
-      input: Array<unknown>
+      reasoning?: { effort?: string }
     }
-
-    expect(body.context_management).toBeUndefined()
-    expect(body.input).toHaveLength(3)
+    expect(body.reasoning?.effort).toBe("xhigh")
   })
 
-  test("disables context management for gpt-6 models even when responses is enabled", async () => {
-    responsesUtilsDependencies.isContextManagementEnabledForResponses = () =>
-      true
+  for (const effort of ["none", "low", "max", "turbo"] as const) {
+    test(`preserves ${effort} when provider capabilities are unknown`, async () => {
+      const app = createApp()
+      const response = await app.request("/openai/v1/responses", {
+        body: JSON.stringify({
+          input: "hello",
+          model: "gpt-test",
+          reasoning: { effort },
+        }),
+        headers: {
+          "content-type": "application/json",
+        },
+        method: "POST",
+      })
 
-    const app = createApp()
-    const response = await app.request("/v1/responses", {
-      body: JSON.stringify({
-        input: [
-          {
-            content: "older",
-            role: "user",
-          },
-          {
-            encrypted_content: "cipher",
-            id: "compaction-1",
-            type: "compaction",
-          },
-          {
-            content: "latest",
-            role: "user",
-          },
-        ],
-        model: "openai/gpt-6",
-      }),
-      headers: {
-        "content-type": "application/json",
-      },
-      method: "POST",
+      expect(response.status).toBe(200)
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+
+      const [, init] = fetchMock.mock.calls[0]
+      const body = parseJsonRequestBody((init as RequestInit).body) as {
+        reasoning?: { effort?: string }
+      }
+      expect(body.reasoning?.effort).toBe(effort)
     })
-
-    expect(response.status).toBe(200)
-    expect(fetchMock).toHaveBeenCalledTimes(1)
-
-    const [, init] = fetchMock.mock.calls[0]
-    const body = parseJsonRequestBody((init as RequestInit).body) as {
-      context_management?: unknown
-      input: Array<unknown>
-    }
-
-    expect(body.context_management).toBeUndefined()
-    expect(body.input).toHaveLength(3)
-  })
+  }
 
   test("supports the provider-scoped responses route", async () => {
     const app = createApp()
@@ -314,5 +650,612 @@ describe("provider Responses context management", () => {
       model: string
     }
     expect(body.model).toBe("gpt-test")
+    expect((init as RequestInit).signal).toBeInstanceOf(AbortSignal)
+  })
+
+  test("forwards safe Codex HTTP response headers", async () => {
+    const originalCodexAccessToken = state.codexAccessToken
+    const originalCodexAccountId = state.codexAccountId
+    providerConfig = {
+      apiKey: "",
+      authType: "oauth2",
+      baseUrl: "https://chatgpt.example/backend-api",
+      models: { "gpt-test": {} },
+      name: "codex",
+      type: "openai-responses",
+    }
+    state.codexAccessToken = "synthetic-codex-token"
+    state.codexAccountId = "synthetic-account"
+    fetchMock.mockImplementation((_url, init) => {
+      const body = parseJsonRequestBody(init?.body) as { model: string }
+      const headers = new Headers({
+        connection: "keep-alive",
+        "content-encoding": "gzip",
+        "content-length": "9999",
+        "openai-processing-ms": "42",
+        "transfer-encoding": "chunked",
+        "x-codex-turn-state": "turn-state-http-123",
+        "x-request-id": "request-http-123",
+      })
+      headers.append("set-cookie", "session=a; Path=/")
+      headers.append("set-cookie", "affinity=b; Path=/")
+      return Promise.resolve(
+        new Response(JSON.stringify(createResponsesResult(body.model)), {
+          headers,
+        }),
+      )
+    })
+
+    try {
+      const response = await createApp().request("/codex/v1/responses", {
+        body: JSON.stringify({ input: "hello", model: "gpt-test" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+
+      expect(response.status).toBe(200)
+      expect(response.headers.get("x-codex-turn-state")).toBe(
+        "turn-state-http-123",
+      )
+      expect(response.headers.get("x-request-id")).toBe("request-http-123")
+      expect(response.headers.get("openai-processing-ms")).toBe("42")
+      expect(response.headers.has("connection")).toBe(false)
+      expect(response.headers.has("content-encoding")).toBe(false)
+      expect(response.headers.has("content-length")).toBe(false)
+      expect(response.headers.has("transfer-encoding")).toBe(false)
+    } finally {
+      state.codexAccessToken = originalCodexAccessToken
+      state.codexAccountId = originalCodexAccountId
+    }
+  })
+
+  test("does not forward Codex HTTP response headers on upstream errors", async () => {
+    const originalCodexAccessToken = state.codexAccessToken
+    const originalCodexAccountId = state.codexAccountId
+    providerConfig = {
+      apiKey: "",
+      authType: "oauth2",
+      baseUrl: "https://chatgpt.example/backend-api",
+      models: { "gpt-test": {} },
+      name: "codex",
+      type: "openai-responses",
+    }
+    state.codexAccessToken = "synthetic-codex-token"
+    state.codexAccountId = "synthetic-account"
+    fetchMock.mockImplementation(() =>
+      Promise.resolve(
+        new Response("upstream denied", {
+          headers: {
+            "set-cookie": "upstream-session=secret; Path=/",
+            "www-authenticate": "Bearer realm=upstream",
+            "x-upstream-private": "do-not-forward",
+          },
+          status: 401,
+        }),
+      ),
+    )
+
+    try {
+      const response = await createApp().request("/codex/v1/responses", {
+        body: JSON.stringify({ input: "hello", model: "gpt-test" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+
+      expect(response.status).toBe(401)
+      expect(response.headers.get("set-cookie")).toBeNull()
+      expect(response.headers.get("www-authenticate")).toBeNull()
+      expect(response.headers.get("x-upstream-private")).toBeNull()
+    } finally {
+      state.codexAccessToken = originalCodexAccessToken
+      state.codexAccountId = originalCodexAccountId
+    }
+  })
+
+  test("keeps codex-prefixed provider models on the native Responses route for Codex clients", async () => {
+    providerConfig = {
+      apiKey: "provider-key",
+      authType: "authorization",
+      baseUrl: "https://openai-responses.example",
+      models: {
+        "codex-mini-latest": {},
+      },
+      name: "openai",
+      type: "openai-responses",
+    }
+
+    const response = await createApp().request("/openai/v1/responses", {
+      body: JSON.stringify({
+        input: "hello",
+        model: "codex-mini-latest",
+      }),
+      headers: {
+        "content-type": "application/json",
+        "user-agent": "codex-cli/1.0.0",
+      },
+      method: "POST",
+    })
+
+    expect(response.status).toBe(200)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+
+    const [, init] = fetchMock.mock.calls[0]
+    const body = parseJsonRequestBody((init as RequestInit).body) as {
+      input: unknown
+      model: string
+    }
+    expect(body).toMatchObject({
+      input: "hello",
+      model: "codex-mini-latest",
+    })
+  })
+
+  test("drains provider-scoped requests after client cancellation", async () => {
+    let upstreamSignal: AbortSignal | undefined
+    const upstreamStarted = createDeferred()
+    const upstreamCompletion = createResponseDeferred()
+    fetchMock.mockImplementation((_url, init) => {
+      const signal = init?.signal
+      if (!(signal instanceof AbortSignal)) {
+        throw new Error("Expected upstream abort signal")
+      }
+      upstreamSignal = signal
+      upstreamStarted.resolve()
+      return upstreamCompletion.promise
+    })
+    const controller = new AbortController()
+    const responsePromise = createApp().fetch(
+      new Request("http://localhost/openai/v1/responses", {
+        body: JSON.stringify({ input: "hello", model: "gpt-test" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+        signal: controller.signal,
+      }),
+    )
+    await upstreamStarted.promise
+
+    controller.abort()
+    expect(upstreamSignal?.aborted).toBe(false)
+    upstreamCompletion.resolve(createJsonResponsesResponse("gpt-test"))
+
+    const response = await responsePromise
+    expect(response.status).toBe(200)
+    expect(upstreamSignal?.aborted).toBe(false)
+  })
+
+  test("drains provider-prefixed Codex requests after client cancellation", async () => {
+    const originalCodexAccessToken = state.codexAccessToken
+    const originalCodexAccountId = state.codexAccountId
+    let upstreamSignal: AbortSignal | undefined
+    const upstreamStarted = createDeferred()
+    const upstreamCompletion = createResponseDeferred()
+    providerConfig = {
+      apiKey: "",
+      authType: "oauth2",
+      baseUrl: "https://chatgpt.example/backend-api",
+      models: { "gpt-test": {} },
+      name: "codex",
+      type: "openai-responses",
+    }
+    state.codexAccessToken = "synthetic-codex-token"
+    state.codexAccountId = "synthetic-account"
+    fetchMock.mockImplementation((url, init) => {
+      expect(url).toBe("https://chatgpt.example/backend-api/codex/responses")
+      const signal = init?.signal
+      if (!(signal instanceof AbortSignal)) {
+        throw new Error("Expected upstream abort signal")
+      }
+      upstreamSignal = signal
+      upstreamStarted.resolve()
+      return upstreamCompletion.promise
+    })
+
+    try {
+      const controller = new AbortController()
+      const responsePromise = createApp().fetch(
+        new Request("http://localhost/codex/v1/responses", {
+          body: JSON.stringify({ input: "hello", model: "gpt-test" }),
+          headers: { "content-type": "application/json" },
+          method: "POST",
+          signal: controller.signal,
+        }),
+      )
+      await upstreamStarted.promise
+
+      controller.abort()
+      expect(upstreamSignal?.aborted).toBe(false)
+      upstreamCompletion.resolve(createJsonResponsesResponse("gpt-test"))
+
+      const response = await responsePromise
+      expect(response.status).toBe(200)
+      expect(upstreamSignal?.aborted).toBe(false)
+    } finally {
+      state.codexAccessToken = originalCodexAccessToken
+      state.codexAccountId = originalCodexAccountId
+    }
+  })
+
+  test("adapts Responses Lite through Messages to Chat Completions", async () => {
+    providerConfig = {
+      apiKey: "provider-key",
+      authType: "authorization",
+      baseUrl: "https://openai-chat.example",
+      models: { "chat-test": {} },
+      name: "openai",
+      type: "openai-compatible",
+    }
+    fetchMock.mockImplementation((_url, init) => {
+      const body = parseJsonRequestBody(init?.body) as {
+        model: string
+        tools: Array<{
+          type: string
+          function: { name: string; strict?: boolean }
+        }>
+      }
+      expect(body.model).toBe("chat-test")
+      expect(body.tools.map((tool) => tool.function.name)).toEqual([
+        "apply_patch",
+        "workspace__read_file",
+      ])
+      expect(body.tools[0]?.function.strict).toBe(true)
+      return Promise.resolve(
+        Response.json({
+          id: "chatcmpl-lite",
+          object: "chat.completion",
+          created: 1,
+          model: "chat-test",
+          choices: [
+            {
+              index: 0,
+              finish_reason: "tool_calls",
+              message: {
+                role: "assistant",
+                content: null,
+                tool_calls: [
+                  {
+                    id: "call-patch",
+                    type: "function",
+                    function: {
+                      name: "apply_patch",
+                      arguments: JSON.stringify({
+                        input: "*** Begin Patch",
+                      }),
+                    },
+                  },
+                  {
+                    id: "call-read",
+                    type: "function",
+                    function: {
+                      name: "workspace__read_file",
+                      arguments: JSON.stringify({ path: "README.md" }),
+                    },
+                  },
+                ],
+              },
+            },
+          ],
+          usage: {
+            prompt_tokens: 12,
+            completion_tokens: 6,
+            total_tokens: 18,
+          },
+        }),
+      )
+    })
+
+    const response = await createApp().request("/v1/responses", {
+      body: JSON.stringify({
+        model: "openai/chat-test",
+        input: [
+          {
+            role: "developer",
+            type: "additional_tools",
+            tools: [
+              { type: "custom", name: "apply_patch" },
+              {
+                type: "namespace",
+                name: "workspace",
+                tools: [
+                  {
+                    type: "function",
+                    name: "read_file",
+                    parameters: {
+                      type: "object",
+                      properties: { path: { type: "string" } },
+                    },
+                    strict: false,
+                  },
+                ],
+              },
+            ],
+          },
+          { type: "message", role: "user", content: "Update and read" },
+        ],
+      }),
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    })
+
+    expect(response.status).toBe(200)
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      "https://openai-chat.example/v1/chat/completions",
+    )
+    const body = (await response.json()) as ResponsesResult
+    expect(body.model).toBe("openai/chat-test")
+    expect(body.output).toMatchObject([
+      {
+        type: "custom_tool_call",
+        call_id: "call-patch",
+        name: "apply_patch",
+        input: "*** Begin Patch",
+      },
+      {
+        type: "function_call",
+        call_id: "call-read",
+        name: "read_file",
+        namespace: "workspace",
+        arguments: JSON.stringify({ path: "README.md" }),
+      },
+    ])
+  })
+
+  test("applies strict to custom tools for the Kimi provider", async () => {
+    providerConfig = {
+      apiKey: "provider-key",
+      authType: "authorization",
+      baseUrl: "https://kimi.example",
+      models: { k3: {} },
+      name: "kimi",
+      type: "openai-compatible",
+    }
+    fetchMock.mockImplementation((_url, init) => {
+      const body = parseJsonRequestBody(init?.body) as {
+        tools: Array<{
+          function: Record<string, unknown>
+          type: string
+        }>
+      }
+      expect(body.tools).toHaveLength(1)
+      expect(body.tools[0]?.function).toMatchObject({ name: "apply_patch" })
+      expect(body.tools[0]?.function.strict).toBe(true)
+      return Promise.resolve(
+        Response.json({
+          id: "chatcmpl-kimi",
+          object: "chat.completion",
+          created: 1,
+          model: "k3",
+          choices: [
+            {
+              index: 0,
+              finish_reason: "stop",
+              message: { role: "assistant", content: "done" },
+            },
+          ],
+          usage: {
+            prompt_tokens: 4,
+            completion_tokens: 1,
+            total_tokens: 5,
+          },
+        }),
+      )
+    })
+
+    const response = await createApp().request("/v1/responses", {
+      body: JSON.stringify({
+        model: "kimi/k3",
+        input: [
+          {
+            role: "developer",
+            type: "additional_tools",
+            tools: [{ type: "custom", name: "apply_patch" }],
+          },
+          { type: "message", role: "user", content: "Update the file" },
+        ],
+      }),
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    })
+
+    expect(response.status).toBe(200)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      "https://kimi.example/v1/chat/completions",
+    )
+  })
+
+  test("adapts Responses Lite directly to an Anthropic Messages provider", async () => {
+    providerConfig = {
+      apiKey: "provider-key",
+      authType: "x-api-key",
+      baseUrl: "https://anthropic.example",
+      models: { "claude-test": {} },
+      name: "anthropic",
+      type: "anthropic",
+    }
+    fetchMock.mockImplementation((_url, init) => {
+      const body = parseJsonRequestBody(init?.body) as {
+        model: string
+        tools: Array<{ name: string }>
+      }
+      expect(body.model).toBe("claude-test")
+      expect(body.tools.map((tool) => tool.name)).toEqual(["apply_patch"])
+      return Promise.resolve(
+        Response.json({
+          content: [
+            {
+              type: "tool_use",
+              id: "call-patch",
+              name: "apply_patch",
+              input: { input: "*** Begin Patch" },
+            },
+          ],
+          id: "msg-lite",
+          model: "claude-test",
+          role: "assistant",
+          stop_reason: "tool_use",
+          stop_sequence: null,
+          type: "message",
+          usage: { input_tokens: 9, output_tokens: 4 },
+        }),
+      )
+    })
+
+    const response = await createApp().request("/v1/responses", {
+      body: JSON.stringify({
+        model: "anthropic/claude-test",
+        input: [
+          {
+            role: "developer",
+            type: "additional_tools",
+            tools: [{ type: "custom", name: "apply_patch" }],
+          },
+          { type: "message", role: "user", content: "Patch it" },
+        ],
+      }),
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    })
+
+    expect(response.status).toBe(200)
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      "https://anthropic.example/v1/messages",
+    )
+    const body = (await response.json()) as ResponsesResult
+    expect(body.model).toBe("anthropic/claude-test")
+    expect(body.output[0]).toMatchObject({
+      type: "custom_tool_call",
+      call_id: "call-patch",
+      name: "apply_patch",
+      input: "*** Begin Patch",
+    })
   })
 })
+
+describe("provider Responses reasoning transport isolation", () => {
+  test("keeps only Messages reasoning when falling back to an Anthropic provider", async () => {
+    providerConfig = {
+      apiKey: "provider-key",
+      authType: "x-api-key",
+      baseUrl: "https://anthropic.example",
+      models: { "claude-test": {} },
+      name: "anthropic",
+      type: "anthropic",
+    }
+    fetchMock.mockImplementation(() =>
+      Promise.resolve(
+        Response.json({
+          content: [{ type: "text", text: "done" }],
+          id: "msg-switch",
+          model: "claude-test",
+          role: "assistant",
+          stop_reason: "end_turn",
+          stop_sequence: null,
+          type: "message",
+          usage: { input_tokens: 8, output_tokens: 2 },
+        }),
+      ),
+    )
+
+    const response = await createApp().request("/v1/responses", {
+      body: JSON.stringify({
+        model: "anthropic/claude-test",
+        input: [
+          {
+            id: "rs_native",
+            type: "reasoning",
+            summary: [],
+            encrypted_content: "native-reasoning",
+          },
+          { role: "assistant", type: "message", content: "Visible answer" },
+          {
+            id: "rs_messages__a1",
+            type: "reasoning",
+            summary: [],
+            encrypted_content: "messages-reasoning",
+          },
+          { role: "user", type: "message", content: "Continue" },
+        ],
+      }),
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    })
+
+    expect(response.status).toBe(200)
+    const [, init] = fetchMock.mock.calls[0] ?? []
+    const body = parseJsonRequestBody((init as RequestInit).body) as {
+      messages: Array<{ content: unknown }>
+    }
+    const blocks = body.messages.flatMap((message) =>
+      Array.isArray(message.content) ?
+        (message.content as Array<Record<string, unknown>>)
+      : [],
+    )
+    const signatures = blocks
+      .filter((block) => block.type === "thinking")
+      .map((block) => block.signature)
+    expect(signatures).toEqual(["messages-reasoning"])
+    expect(blocks).toContainEqual({ type: "text", text: "Visible answer" })
+  })
+
+  test("drops Messages reasoning when forwarding to an openai-responses provider", async () => {
+    const response = await createApp().request("/v1/responses", {
+      body: JSON.stringify({
+        model: "openai/gpt-test",
+        input: [
+          {
+            id: "rs_native",
+            type: "reasoning",
+            summary: [],
+            encrypted_content: "native-reasoning",
+          },
+          {
+            id: "rs_messages__a1",
+            type: "reasoning",
+            summary: [],
+            encrypted_content: "messages-reasoning",
+          },
+          { role: "user", type: "message", content: "Continue" },
+        ],
+      }),
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    })
+
+    expect(response.status).toBe(200)
+    const [, init] = fetchMock.mock.calls[0] ?? []
+    const body = parseJsonRequestBody((init as RequestInit).body) as {
+      input: Array<Record<string, unknown>>
+    }
+    const reasoningIds = body.input
+      .filter((item) => item.type === "reasoning")
+      .map((item) => item.id)
+    expect(reasoningIds).toEqual(["rs_native"])
+  })
+})
+
+const createDeferred = (): {
+  promise: Promise<void>
+  resolve: () => void
+} => {
+  let resolve!: () => void
+  const promise = new Promise<void>((deferredResolve) => {
+    resolve = deferredResolve
+  })
+  return { promise, resolve }
+}
+
+const createResponseDeferred = (): {
+  promise: Promise<Response>
+  resolve: (response: Response) => void
+} => {
+  let resolve!: (response: Response) => void
+  const promise = new Promise<Response>((deferredResolve) => {
+    resolve = deferredResolve
+  })
+  return { promise, resolve }
+}
+
+const createJsonResponsesResponse = (model: string): Response =>
+  new Response(JSON.stringify(createResponsesResult(model)), {
+    headers: { "content-type": "application/json" },
+  })

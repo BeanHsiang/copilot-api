@@ -18,7 +18,13 @@ export type TokenUsageEndpoint =
   | "provider_messages"
   | "responses"
 
-export type TokenUsagePeriod = "day" | "week" | "month"
+export type TokenUsagePeriod =
+  | "today"
+  | "this_week"
+  | "last_7_days"
+  | "this_month"
+  | "last_30_days"
+  | "lifetime"
 
 export interface UsageTokens {
   cache_creation_input_tokens?: number | null
@@ -76,6 +82,10 @@ export interface TokenUsageModelSummary extends TokenUsageTotals {
   model: string
 }
 
+export interface TokenUsageSessionSummary extends TokenUsageTotals {
+  session_id: string
+}
+
 export interface TokenUsageEventRecord {
   cache_creation_input_tokens: number
   cache_read_input_tokens: number
@@ -129,8 +139,8 @@ export interface TokenUsageDailySummary {
   totals: TokenUsageTotals
 }
 
-export interface TokenUsageEventsPage {
-  items: Array<TokenUsageEventRecord>
+interface TokenUsagePage<T> {
+  items: Array<T>
   page: number
   page_size: number
   period: TokenUsagePeriod
@@ -143,6 +153,9 @@ export interface TokenUsageEventsPage {
   total: number
   total_pages: number
 }
+
+export type TokenUsageEventsPage = TokenUsagePage<TokenUsageEventRecord>
+export type TokenUsageSessionsPage = TokenUsagePage<TokenUsageSessionSummary>
 
 const DB_PATH_ENV = "COPILOT_API_SQLITE_DB_PATH"
 const DEFAULT_DB_FILENAME = "copilot-api.sqlite"
@@ -349,18 +362,35 @@ async function flushTokenUsageEvents(): Promise<void> {
 }
 
 function getPeriodRange(period: TokenUsagePeriod, now = new Date()) {
+  const nowMs = now.getTime()
+  if (period === "lifetime") {
+    return {
+      endMs: nowMs + 1,
+      startMs: nowMs + 1,
+    }
+  }
+
   const start = new Date(now)
   start.setHours(0, 0, 0, 0)
 
   switch (period) {
-    case "day": {
+    case "today": {
       break
     }
-    case "week": {
+    case "this_week": {
+      const daysSinceMonday = (start.getDay() + 6) % 7
+      start.setDate(start.getDate() - daysSinceMonday)
+      break
+    }
+    case "last_7_days": {
       start.setDate(start.getDate() - 6)
       break
     }
-    case "month": {
+    case "this_month": {
+      start.setDate(1)
+      break
+    }
+    case "last_30_days": {
       start.setDate(start.getDate() - 29)
       break
     }
@@ -369,28 +399,39 @@ function getPeriodRange(period: TokenUsagePeriod, now = new Date()) {
     }
   }
 
-  const end = new Date(start)
-  switch (period) {
-    case "day": {
-      end.setDate(end.getDate() + 1)
-      break
-    }
-    case "week": {
-      end.setDate(end.getDate() + 7)
-      break
-    }
-    case "month": {
-      end.setDate(end.getDate() + 30)
-      break
-    }
-    default: {
-      break
-    }
+  return {
+    endMs: nowMs + 1,
+    startMs: start.getTime(),
+  }
+}
+
+function getPeriodRangeFromDb(
+  db: SqliteDatabase,
+  period: TokenUsagePeriod,
+  now = new Date(),
+) {
+  if (period !== "lifetime") {
+    return getPeriodRange(period, now)
   }
 
+  const nowMs = now.getTime()
+  const row = db
+    .prepare(
+      `
+    SELECT MIN(created_at_ms) AS start_ms
+    FROM token_usage_events
+    WHERE created_at_ms <= ?
+  `,
+    )
+    .get(nowMs) as Record<string, unknown> | undefined
+  const earliestEventMs = row?.start_ms
+  const hasEarliestEvent =
+    typeof earliestEventMs === "number" && Number.isFinite(earliestEventMs)
+  const startMs = hasEarliestEvent ? earliestEventMs : nowMs + 1
+
   return {
-    endMs: end.getTime(),
-    startMs: start.getTime(),
+    endMs: nowMs + 1,
+    startMs,
   }
 }
 
@@ -408,18 +449,21 @@ function createDailyIntervals(range: { endMs: number; startMs: number }) {
     startMs: number
   }> = []
   const cursor = new Date(range.startMs)
+  cursor.setHours(0, 0, 0, 0)
 
   while (cursor.getTime() < range.endMs) {
-    const startMs = cursor.getTime()
+    const startMs = Math.max(cursor.getTime(), range.startMs)
     const next = new Date(cursor)
     next.setDate(next.getDate() + 1)
     const endMs = Math.min(next.getTime(), range.endMs)
-    intervals.push({
-      date: formatLocalDate(cursor),
-      endMs,
-      startMs,
-    })
-    cursor.setTime(endMs)
+    if (startMs < endMs) {
+      intervals.push({
+        date: formatLocalDate(cursor),
+        endMs,
+        startMs,
+      })
+    }
+    cursor.setTime(next.getTime())
   }
 
   return intervals
@@ -789,6 +833,74 @@ function getModelCostMap(
   return costMap
 }
 
+function getSessionSummaries(
+  db: SqliteDatabase,
+  range: { endMs: number; startMs: number },
+  limit: number,
+  offset: number,
+): Array<TokenUsageSessionSummary> {
+  const rows = db
+    .prepare(
+      `
+    SELECT
+      session_id,
+      COUNT(*) AS request_count,
+      COALESCE(SUM(input_tokens), 0) AS input_tokens,
+      COALESCE(SUM(output_tokens), 0) AS output_tokens,
+      COALESCE(SUM(cache_read_input_tokens), 0) AS cache_read_input_tokens,
+      COALESCE(SUM(cache_creation_input_tokens), 0) AS cache_creation_input_tokens,
+      SUM(total_nano_aiu) AS total_nano_aiu,
+      COALESCE(SUM(total_tokens), 0) AS total_tokens
+    FROM token_usage_events
+    WHERE created_at_ms >= ? AND created_at_ms < ?
+    GROUP BY session_id
+    ORDER BY total_tokens DESC, session_id ASC
+    LIMIT ? OFFSET ?
+  `,
+    )
+    .all(range.startMs, range.endMs, limit, offset) as Array<
+    Record<string, unknown>
+  >
+  const sessionIds = rows.map((row) => stringFromRow(row, "session_id"))
+  const costRows = db
+    .prepare(
+      `
+    SELECT
+      session_id,
+      cost_currency,
+      COALESCE(SUM(total_cost_nanos), 0) AS total_cost_nanos
+    FROM token_usage_events
+    WHERE
+      created_at_ms >= ?
+      AND created_at_ms < ?
+      AND session_id IN (${sessionIds.map(() => "?").join(", ")})
+      AND cost_currency IS NOT NULL
+      AND total_cost_nanos IS NOT NULL
+    GROUP BY session_id, cost_currency
+    ORDER BY session_id ASC, cost_currency ASC
+  `,
+    )
+    .all(range.startMs, range.endMs, ...sessionIds) as Array<
+    Record<string, unknown>
+  >
+  const costMap = new Map<string, Array<TokenUsageCost>>()
+  for (const row of costRows) {
+    const cost = costFromRow(row)
+    if (cost) {
+      const id = stringFromRow(row, "session_id")
+      costMap.set(id, [...(costMap.get(id) ?? []), cost])
+    }
+  }
+
+  return rows.map((row) => {
+    const session_id = stringFromRow(row, "session_id")
+    return {
+      ...totalsFromRow(row, costMap.get(session_id) ?? []),
+      session_id,
+    }
+  })
+}
+
 function getModelSummaries(
   db: SqliteDatabase,
   range: { endMs: number; startMs: number },
@@ -798,6 +910,106 @@ function getModelSummaries(
     const model = stringFromRow(row, "model") || "unknown"
     return modelSummaryFromRow(row, costMap.get(model) ?? [])
   })
+}
+
+function getDailyModelSummaries(
+  db: SqliteDatabase,
+  intervals: Array<{ date: string; endMs: number; startMs: number }>,
+): Map<string, Array<TokenUsageModelSummary>> {
+  if (intervals.length === 0) {
+    return new Map()
+  }
+
+  // Bucket events by the same local-day intervals the response reports.
+  // SQLite's 'localtime' follows the C library timezone, which can disagree
+  // with the JavaScript runtime (bun test forces UTC; images without tzdata
+  // ignore TZ), putting events in the wrong day.
+  const usageDays = `usage_days(usage_date, day_start_ms, day_end_ms) AS (VALUES ${intervals
+    .map(() => "(?, ?, ?)")
+    .join(", ")})`
+  const dayParams = intervals.flatMap((interval) => [
+    interval.date,
+    interval.startMs,
+    interval.endMs,
+  ])
+  const rows = db
+    .prepare(
+      `
+    WITH ${usageDays}
+    SELECT
+      usage_days.usage_date AS usage_date,
+      model,
+      COUNT(*) AS request_count,
+      COALESCE(SUM(input_tokens), 0) AS input_tokens,
+      COALESCE(SUM(output_tokens), 0) AS output_tokens,
+      COALESCE(SUM(cache_read_input_tokens), 0) AS cache_read_input_tokens,
+      COALESCE(SUM(cache_creation_input_tokens), 0) AS cache_creation_input_tokens,
+      SUM(total_nano_aiu) AS total_nano_aiu,
+      COALESCE(SUM(total_tokens), 0) AS total_tokens
+    FROM usage_days
+    JOIN token_usage_events
+      ON created_at_ms >= usage_days.day_start_ms
+      AND created_at_ms < usage_days.day_end_ms
+    GROUP BY usage_days.usage_date, model
+    ORDER BY usage_days.usage_date ASC, total_tokens DESC, model ASC
+  `,
+    )
+    .all(...dayParams) as Array<Record<string, unknown>>
+  const costRows = db
+    .prepare(
+      `
+    WITH ${usageDays}
+    SELECT
+      usage_days.usage_date AS usage_date,
+      model,
+      cost_currency,
+      COALESCE(SUM(total_cost_nanos), 0) AS total_cost_nanos
+    FROM usage_days
+    JOIN token_usage_events
+      ON created_at_ms >= usage_days.day_start_ms
+      AND created_at_ms < usage_days.day_end_ms
+    WHERE cost_currency IS NOT NULL
+      AND total_cost_nanos IS NOT NULL
+    GROUP BY usage_days.usage_date, model, cost_currency
+    ORDER BY usage_days.usage_date ASC, model ASC, cost_currency ASC
+  `,
+    )
+    .all(...dayParams) as Array<Record<string, unknown>>
+  const costsByDateAndModel = new Map<string, Array<TokenUsageCost>>()
+  for (const row of costRows) {
+    const date = stringFromRow(row, "usage_date")
+    const model = stringFromRow(row, "model") || "unknown"
+    const cost = costFromRow(row)
+    if (!date || !cost) {
+      continue
+    }
+
+    const key = `${date}\u0000${model}`
+    costsByDateAndModel.set(key, [
+      ...(costsByDateAndModel.get(key) ?? []),
+      cost,
+    ])
+  }
+
+  const summariesByDate = new Map<string, Array<TokenUsageModelSummary>>()
+  for (const row of rows) {
+    const date = stringFromRow(row, "usage_date")
+    if (!date) {
+      continue
+    }
+
+    const model = stringFromRow(row, "model") || "unknown"
+    const summaries = summariesByDate.get(date) ?? []
+    summaries.push(
+      modelSummaryFromRow(
+        row,
+        costsByDateAndModel.get(`${date}\u0000${model}`) ?? [],
+      ),
+    )
+    summariesByDate.set(date, summaries)
+  }
+
+  return summariesByDate
 }
 
 function createDailyBucket(
@@ -826,8 +1038,8 @@ export async function getTokenUsageSummary(
   }
 
   await flushTokenUsageEvents()
-  const range = getPeriodRange(period)
   const db = await getDb()
+  const range = getPeriodRangeFromDb(db, period)
   const totalsRow = getTotalsRow(db, range)
 
   return {
@@ -846,14 +1058,15 @@ export async function getTokenUsageDailySummary(
   }
 
   await flushTokenUsageEvents()
-  const range = getPeriodRange(period)
   const db = await getDb()
+  const range = getPeriodRangeFromDb(db, period)
   const intervals = createDailyIntervals(range)
+  const dailySummaries = getDailyModelSummaries(db, intervals)
 
   return {
     byModel: getModelSummaries(db, range),
     days: intervals.map((interval) =>
-      createDailyBucket(interval, getModelSummaries(db, interval)),
+      createDailyBucket(interval, dailySummaries.get(interval.date) ?? []),
     ),
     period,
     range: rangePayload(range),
@@ -871,11 +1084,11 @@ export async function getTokenUsageEventsPage(input: {
   }
 
   await flushTokenUsageEvents()
-  const range = getPeriodRange(input.period)
   const page = Math.max(1, Math.floor(input.page))
   const pageSize = Math.min(100, Math.max(1, Math.floor(input.pageSize)))
   const offset = (page - 1) * pageSize
   const db = await getDb()
+  const range = getPeriodRangeFromDb(db, input.period)
 
   const totalRow = db
     .prepare(
@@ -933,6 +1146,42 @@ export async function getTokenUsageEventsPage(input: {
       start_ms: range.startMs,
       start_utc: new Date(range.startMs).toISOString(),
     },
+    total,
+    total_pages: Math.max(1, Math.ceil(total / pageSize)),
+  }
+}
+
+export async function getTokenUsageSessionsPage(input: {
+  page: number
+  pageSize: number
+  period: TokenUsagePeriod
+}): Promise<TokenUsageSessionsPage> {
+  const page = Math.max(1, Math.floor(input.page))
+  const pageSize = Math.min(100, Math.max(1, Math.floor(input.pageSize)))
+  if (!isTokenUsageStorageEnabled()) {
+    return { ...createEmptyEventsPage(input), items: [] }
+  }
+
+  await flushTokenUsageEvents()
+  const db = await getDb()
+  const range = getPeriodRangeFromDb(db, input.period)
+  const totalRow = db
+    .prepare(
+      `
+    SELECT COUNT(DISTINCT session_id) AS total
+    FROM token_usage_events
+    WHERE created_at_ms >= ? AND created_at_ms < ?
+  `,
+    )
+    .get(range.startMs, range.endMs) as Record<string, unknown> | undefined
+  const total = numberFromRow(totalRow, "total")
+
+  return {
+    items: getSessionSummaries(db, range, pageSize, (page - 1) * pageSize),
+    page,
+    page_size: pageSize,
+    period: input.period,
+    range: rangePayload(range),
     total,
     total_pages: Math.max(1, Math.ceil(total / pageSize)),
   }

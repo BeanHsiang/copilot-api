@@ -10,61 +10,78 @@ interface CodexModelDefinition {
   input: Array<"text" | "image">
   maxTokens: number
   name: string
+  reasoningEfforts: Array<string>
 }
 
 const CODEX_MODELS: Array<CodexModelDefinition> = [
   {
-    contextWindow: 100_000,
-    id: "gpt-5.3-codex-spark",
-    input: ["text"],
-    maxTokens: 32_000,
-    name: "GPT-5.3 Codex Spark",
-  },
-  {
-    contextWindow: 400_000,
-    id: "gpt-5.4",
-    input: ["text", "image"],
-    maxTokens: 128_000,
-    name: "GPT-5.4",
-  },
-  {
-    contextWindow: 400_000,
-    id: "gpt-5.4-mini",
-    input: ["text", "image"],
-    maxTokens: 128_000,
-    name: "GPT-5.4 mini",
-  },
-  {
-    contextWindow: 272_000,
-    id: "gpt-5.5",
-    input: ["text", "image"],
-    maxTokens: 128_000,
-    name: "GPT-5.5",
-  },
-  {
-    contextWindow: 372_000,
+    contextWindow: 872_000,
     id: "gpt-5.6-sol",
     input: ["text", "image"],
     maxTokens: 128_000,
     name: "GPT-5.6 Sol",
+    reasoningEfforts: ["none", "low", "medium", "high", "xhigh", "max"],
   },
   {
-    contextWindow: 372_000,
+    contextWindow: 872_000,
     id: "gpt-5.6-terra",
     input: ["text", "image"],
     maxTokens: 128_000,
     name: "GPT-5.6 Terra",
+    reasoningEfforts: ["none", "low", "medium", "high", "xhigh", "max"],
   },
   {
-    contextWindow: 372_000,
+    contextWindow: 872_000,
     id: "gpt-5.6-luna",
     input: ["text", "image"],
     maxTokens: 128_000,
     name: "GPT-5.6 Luna",
+    reasoningEfforts: ["none", "low", "medium", "high", "xhigh", "max"],
   },
+  {
+    contextWindow: 872_000,
+    id: "gpt-6-astra",
+    input: ["text", "image"],
+    maxTokens: 128_000,
+    name: "GPT-6 Astra",
+    reasoningEfforts: ["low", "medium", "high", "xhigh", "max"],
+  },
+  {
+    contextWindow: 872_000,
+    id: "gpt-6-luna",
+    input: ["text", "image"],
+    maxTokens: 128_000,
+    name: "GPT-6 Luna",
+    reasoningEfforts: ["none", "low", "medium", "high", "xhigh", "max"],
+  },
+  {
+    contextWindow: 872_000,
+    id: "gpt-6-sol",
+    input: ["text", "image"],
+    maxTokens: 128_000,
+    name: "GPT-6 Sol",
+    reasoningEfforts: ["none", "low", "medium", "high", "xhigh", "max"],
+  },
+  {
+    contextWindow: 872_000,
+    id: "gpt-6.1-sol",
+    input: ["text", "image"],
+    maxTokens: 128_000,
+    name: "GPT-6.1 Sol",
+    reasoningEfforts: ["low", "medium", "high", "xhigh", "max"],
+  },
+  ...["codex-auto-review", "gpt-reserve"].map((id) => ({
+    contextWindow: 872_000,
+    id,
+    input: ["text", "image"] as Array<"text" | "image">,
+    maxTokens: 128_000,
+    name: id,
+    reasoningEfforts: ["none", "low", "medium", "high", "xhigh", "max"],
+  })),
 ]
 
 const CODEX_MODELS_URL = `${CODEX_API_BASE_URL}/codex/models`
+const CODEX_MODELS_TIMEOUT_MS = 15_000
 
 export function resolveCodexModelsUrl(requestUrl: string): string {
   const upstreamUrl = new URL(CODEX_MODELS_URL)
@@ -84,6 +101,7 @@ export async function forwardCodexModels(
   return await fetch(resolveCodexModelsUrl(requestUrl), {
     method: "GET",
     headers,
+    signal: AbortSignal.timeout(CODEX_MODELS_TIMEOUT_MS),
   })
 }
 
@@ -102,7 +120,7 @@ function normalizeCodexModel(model: CodexModelDefinition): Model {
       supports: {
         adaptive_thinking: true,
         parallel_tool_calls: true,
-        reasoning_effort: ["minimal", "low", "medium", "high", "xhigh"],
+        reasoning_effort: model.reasoningEfforts,
         streaming: true,
         tool_calls: true,
         vision: supportsVision,
